@@ -6,6 +6,7 @@
 #
 # Example:
 #   bash env_tests/retry_hf_download.sh Qwen/Qwen2.5-Math-1.5B
+#                                       mlx-community/Qwen2.5-Math-1.5B-bf16
 
 set -u
 

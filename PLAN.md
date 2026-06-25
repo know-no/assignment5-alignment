@@ -138,6 +138,8 @@ uv sync --extra gpu          # 装齐 flash-attn + vllm
 
   ```sh
   curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
+  # 评估脚本依赖的额外包（drgrpo_grader 用）
+  ~/.venv-vllm-metal/bin/pip install latex2sympy2_extended math_verify pylatexenc==2.10
   ```
 
   当前装的版本：`vllm-metal 0.3.0.dev` / `vllm 0.23.0` / Python 3.12 arm64。

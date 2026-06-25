@@ -1,3 +1,5 @@
+outputs/
+
 *.bin
 models/
 data/
