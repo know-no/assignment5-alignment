@@ -38,7 +38,19 @@ no-build-isolation-package = ["flash-attn"]
 [tool.uv.sources]
 alpaca-eval = { git = "https://github.com/nelson-liu/alpaca_eval.git", rev = "forward_kwargs_to_vllm" }
 
+#跳过目录
+# uv run pytest tests/ -k test_tokenize_prompt_and_output
+# uv run pytest -k test_tokenize_prompt_and_output --ignore=env_tests
+#给那些文件加 pytest.importorskip（如果你想保留它们偶尔跑）
+#在 env_tests/test_vllm_*.py 顶部：
+#import pytest
+#vllm = pytest.importorskip("vllm")
+#这样没装 vllm 时整个文件被自动 skip，不算 collection 错误。
+
 [tool.pytest.ini_options]
+testpaths = ["tests"]          # 只收集 tests 目录
+# 或者
+norecursedirs = ["env_tests"]  # 跳过 env_tests
 log_cli = true
 log_cli_level = "WARNING"
 

@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
+from cs336_alignment.utils import tokenizer_utils
 
 
 def run_tokenize_prompt_and_output(
@@ -31,8 +32,8 @@ def run_tokenize_prompt_and_output(
             "response_mask": torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1):
                 a mask on the response tokens in `labels`.
     """
-    raise NotImplementedError
-
+    # OSError: Repo id must be in the form 'repo_name' or 'namespace/repo_name': '/data/a5-alignment/models/Qwen2.5-Math-1.5B'. Use `repo_type` argument if needed.
+    return tokenizer_utils.tokenize_prompt_and_output(prompt_strs, output_strs, tokenizer)
 
 def run_compute_group_normalized_rewards(
     reward_fn: Callable,
