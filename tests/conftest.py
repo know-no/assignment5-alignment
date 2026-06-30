@@ -59,6 +59,11 @@ class NumpySnapshot:
         arrays_dict = actual if isinstance(actual, dict) else {"array": actual}
         arrays_dict = {k: _canonicalize_array(v) for k, v in arrays_dict.items()}
 
+        # Allow regenerating snapshots locally (e.g. when running on a different
+        # hardware/dtype than the one that produced the committed snapshot).
+        if force_update or os.environ.get("UPDATE_SNAPSHOTS") == "1" or not snapshot_path.exists():
+            np.savez(snapshot_path, **arrays_dict)
+            return
 
         # Load the snapshot
         expected_arrays = dict(np.load(snapshot_path))
@@ -225,6 +230,19 @@ def tokenizer(model_id):
 @pytest.fixture
 def model(model_id):
     return AutoModelForCausalLM.from_pretrained(model_id)
+
+# @pytest.fixture
+# def model(model_id):
+#     if torch.backends.mps.is_available():
+#         return AutoModelForCausalLM.from_pretrained(model_id,
+#             dtype=torch.float32,  # MPS 上 float32 最稳；bf16 在部分算子还不支持
+#             attn_implementation="eager")
+#     elif torch.backends.cuda.is_available():
+#         return AutoModelForCausalLM.from_pretrained(model_id)
+#     else:
+#         return AutoModelForCausalLM.from_pretrained(model_id,
+#             dtype=torch.float32,  # MPS 上 float32 最稳；bf16 在部分算子还不支持
+#             attn_implementation="eager")
 
 
 @pytest.fixture
