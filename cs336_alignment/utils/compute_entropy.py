@@ -89,3 +89,25 @@ def get_response_log_probs(
     if return_token_entropy:
         result["token_entropy"] = compute_entropy(logits)
     return result
+
+
+def masked_normalize(
+    tensor: torch.Tensor,
+    mask: torch.Tensor,
+    normalize_constant: float,
+    dim: int | None = None,
+) -> torch.Tensor:
+    """
+    对一个维度求和并用一个常数进行归一化，只考虑掩码为 1 的元素。
+
+    Args:
+        tensor: torch.Tensor 要求和和归一化的张量。
+        mask: torch.Tensor 与 tensor 形状相同；掩码为 1 的位置包含在求和中。
+        normalize_constant: float 用于归一化的常数。
+        dim: int | None 要在归一化前求和的维度。如果为 None，则对所有维度求和。
+
+    Returns:
+        torch.Tensor 归一化的和，其中掩码元素（mask==0）不贡献于求和。
+    """
+    masked = (tensor * mask)
+    return masked.sum(dim=dim) / normalize_constant
