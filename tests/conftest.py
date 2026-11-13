@@ -51,7 +51,13 @@ class NumpySnapshot:
         Args:
             actual: Single NumPy array or dictionary of named arrays
             test_name: The name of the test (used for the snapshot file)
-            update: If True, update the snapshot instead of comparing
+            force_update: If True, write the current arrays as the new snapshot.
+
+        Existing snapshots are compared by default. Setting UPDATE_SNAPSHOTS=1,
+        passing force_update=True, or using a missing snapshot writes the current
+        arrays and returns before comparison. This supports local reference data
+        for independently validated hardware/dtype configurations, including the
+        Mac/BF16 setup documented in commit 37b5cfb.
         """
         snapshot_path = self._get_snapshot_path(test_name)
 
@@ -59,8 +65,9 @@ class NumpySnapshot:
         arrays_dict = actual if isinstance(actual, dict) else {"array": actual}
         arrays_dict = {k: _canonicalize_array(v) for k, v in arrays_dict.items()}
 
-        # Allow regenerating snapshots locally (e.g. when running on a different
-        # hardware/dtype than the one that produced the committed snapshot).
+        # Explicit updates and missing snapshots save a new reference and return.
+        # For model tests, validate hardware/dtype differences before accepting
+        # local reference data. Keep update runs scoped to the intended test.
         if force_update or os.environ.get("UPDATE_SNAPSHOTS") == "1" or not snapshot_path.exists():
             np.savez(snapshot_path, **arrays_dict)
             return
@@ -229,7 +236,9 @@ def tokenizer(model_id):
 
 @pytest.fixture
 def model(model_id):
-    return AutoModelForCausalLM.from_pretrained(model_id)
+    # 显式使用 FP32 前向，对照现有 log-prob 和 entropy 数值快照。
+    # BF16 的真实生成、SFT 反传和日志衔接由 test_logging.py 的微型模型覆盖。
+    return AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float32)
 
 # @pytest.fixture
 # def model(model_id):

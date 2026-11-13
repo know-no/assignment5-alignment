@@ -5,7 +5,7 @@
 完成 CS336 Assignment 5（MATH 数据集上的 SFT / Expert Iteration / GRPO），
 **本机 (Mac M2) 写完所有代码 + 单测全过**，最后**租 1-2 天 GPU 集中跑训练实验**。
 
-不做 Safety RLHF 可选部分（除非时间富余）。
+完成范围包括主作业全部 26 个 Problem，其中 Off-policy GRPO 和 Leaderboard 均为必做内容。Safety/RLHF 补充作业为可选部分，暂不做（除非时间富余）。
 
 ---
 
@@ -105,7 +105,7 @@ Mac 上做 10-16；16 的实际跑通见 17-19。
 
 > 注：H100 小时是 PDF 中给出的参考值。A100 上一般 ×1.5-2 倍时间，所以租 A100 80GB 实际可能要 ~70-90 小时；预算从原来的 ~$30-50 上调到 **~$70-150**。
 
-> 注：`leaderboard` 是开放性比赛题，16 H100 小时是上限，可以少投入。如果只做必修部分，跳过 22-26 也能拿到大头分数。
+> 注：题号 22-26（Off-policy GRPO、相关消融及 Leaderboard）均属于主作业，不能按可选部分跳过。主作业 PDF 第 33 页明确将 Leaderboard 称为 mandatory assignment 的最后一部分；只有单独的 Safety/RLHF 补充作业是可选的。若分阶段推进，22-26 可以后做，但仍需完成才能交齐主作业。
 
 ---
 

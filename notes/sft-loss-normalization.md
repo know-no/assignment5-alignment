@@ -3,8 +3,8 @@
 > 锚点代码:
 >
 > - [cs336_alignment/utils/tokenizer_utils.py:21](../cs336_alignment/utils/tokenizer_utils.py#L21) `tokenize_prompt_and_output`(生产 `response_mask`)
-> - [cs336_alignment/utils/compute_entropy.py:94](../cs336_alignment/utils/compute_entropy.py#L94) `masked_normalize`
-> - [cs336_alignment/utils/sft_utils.py:5](../cs336_alignment/utils/sft_utils.py#L5) `sft_microbatch_train_step`
+> - [cs336_alignment/utils/compute_entropy.py:96](../cs336_alignment/utils/compute_entropy.py#L96) `masked_normalize`
+> - [cs336_alignment/utils/sft_utils.py:14](../cs336_alignment/utils/sft_utils.py#L14) `sft_microbatch_train_step`
 >
 > 主线:**作用域**(§0 谁进 loss)→ **尺度**(§1 用什么归一化)→ **形状**(§2 `dim=None` 语义)→ **反传**(§3 microbatch + 梯度累积)。这一篇覆盖 SFT 从 mask 到 backward 的整条链路。
 
@@ -45,7 +45,7 @@ $$
 | `mask`(`response_mask`) | **作用域** —— 谁进 loss | prompt 长时 response 信号是否被稀释 | 本节 |
 | `normalize_constant` | **尺度** —— 怎么归一化 | 响应长度不同时单 token 权重是否公平 | §1 |
 
-两者叠加,才让 SFT 的 loss 对"prompt 长短"和"response 长短"都不敏感。
+`response_mask` 排除 prompt 和 padding 位置的直接损失，`normalize_constant` 决定有效 token 的统一缩放。固定常数下，较长回答会贡献更多有效 token，其整条回答的损失仍可能更大。
 
 ### 代码落点
 
@@ -71,14 +71,14 @@ for j in range(output_start_idx - 1, output_start_idx - 1 + output_size):
 
 | 方式 | 表达式 | 单 token 梯度大小 |
 |---|---|---|
-| per-token mean(常见但有偏) | `(tensor * mask).sum() / mask.sum()` | **取决于该样本有效 token 数** |
-| 固定常数(Dr.GRPO / 本作业要求) | `(tensor * mask).sum() / normalize_constant` | **与样本长度无关** |
+| 整批有效 token 平均 | `(tensor * mask).sum() / mask.sum()` | 统一除以整批有效 token 总数 |
+| 固定常数（本作业此处采用） | `(tensor * mask).sum() / normalize_constant` | 统一除以固定的 `C` |
 
 ### 为什么要用固定常数
 
-用 `mask.sum()` 当分母时,长序列里每个 token 的贡献被稀释——分母大、单 token 梯度小,模型实际上隐式地**更看重短序列的 token**。这就是 Dr.GRPO 等工作指出的**长度偏差(length bias)**。
+对整个 `(B, L)` 张量使用 `mask.sum()`，会让这批所有有效 token 共享同一个分母。若先对每条回答除以各自长度、再对样本平均，短回答中单个 token 的系数会更大。这两种归一化沿不同的轴进行，需要结合实际 reduction 判断权重。
 
-固定常数(典型取 `max_response_length`,或干脆 `1.0`)让每个 token 贡献的梯度大小**不依赖它所属序列的长度**,行为更可控、和"每个 token 一票"的直觉一致。
+本作业此处使用固定的 `C`，每个有效 token 对 loss 的系数相同。回答越长，有效 token 通常越多，因此整条回答的总权重仍可能更大。下面所说的统一系数指 loss 对输入 log-prob 的导数，模型参数梯度还取决于上游计算图。
 
 ### 在 SFT pipeline 里的位置
 
@@ -86,8 +86,8 @@ for j in range(output_start_idx - 1, output_start_idx - 1 + output_size):
 per-token NLL  →  masked_normalize(.., dim=None) / batch_size / grad_accum_steps  →  backward()
 ```
 
-- `normalize_constant` 处理**序列长度方向**的偏差
-- 再除以 `batch_size`、`grad_accum_steps` 控制**梯度噪声大小**和**有效 batch size**
+- `normalize_constant` 对有效 token 的求和结果进行固定缩放。
+- 除以 `batch_size` 对当前 microbatch 的样本取平均，再除以 `grad_accum_steps`，使等大小 microbatch 的累积梯度对应整个有效 batch 的平均损失。
 
 ## 2. `dim=None` 的语义:为什么不是"只有最后一维有数据"
 
@@ -122,25 +122,37 @@ masked_normalize(tensor, mask, C, dim=-1)
 
 ### SFT 目标函数
 
-最大化响应 token 的对数似然,等价于最小化其负值:
+对当前 microbatch，最大化响应 token 的对数似然，等价于最小化其负值。用于反传的标量损失为
 
 $$
-\mathcal{L}_{\text{SFT}}(\theta) = -\frac{1}{C} \sum_{(x, y)} \sum_{t \in \text{response}} \log p_\theta(y_t \mid x, y_{<t})
+\mathcal{L}_{\text{micro}}(\theta) = -\frac{1}{BCK} \sum_{b=1}^{B} \sum_{t=1}^{L} m_{b,t}\log p_\theta(y_{b,t} \mid x_b, y_{b,<t})
 $$
 
-其中 $C$ 就是 `normalize_constant`。上游 `get_response_log_probs` 已经把 `log p_θ(y_t | ...)` 算好,microbatch step 负责**加负号、按 mask 聚合、除梯度累积步数、反传**。
+其中 $B$ 是当前 microbatch 的样本数，$C$ 是 `normalize_constant`，$K$ 是 `gradient_accumulation_steps`，$m$ 是 `response_mask`。上游 `get_response_log_probs` 已经计算并选出了标准答案 token 的 log-prob，当前函数负责取负、按 mask 求和、除以 $C$、对样本平均、除以 $K$ 并反传。
+
+### 为什么交叉熵只剩负的 log-prob
+
+多分类交叉熵（Categorical Cross-Entropy，CCE，通常简称 CE）为 $-\sum_i q_i\log p_i$。每个位置的标准答案给出一个 one-hot 目标分布 $q$，正确 token 对应项为 1，其余为 0，因此求和简化为 $-\log p_{\text{gold}}$。标签 ID 用来选取对应项。
+
+正确 token 的概率从 `0.2` 提高到 `0.8` 时，$-\log p$ 从约 `1.609` 降到 `0.223`。负号使最小化损失与提高正确 token 的概率一致。BCE 是二分类的交叉熵，标签为 1 时同样得到 $-\log p$，标签为 0 时得到 $-\log(1-p)$。MSE（Mean Squared Error）则计算数值预测误差的平方平均，常用于回归任务。
+
+### 用一个 microbatch 检查数值和梯度
+
+设 `policy_log_probs = [[-1, -2], [-3, -4]]`，`response_mask = [[1, 1], [1, 0]]`，$C=1$、$B=2$、$K=2$。两条回答的负对数似然都是 `3`，样本平均 `unscaled_loss` 为 `3`，除以 $K$ 后返回的 `loss` 为 `1.5`。
+
+对任一输入 log-prob 求导，得到 $\partial\mathcal{L}_{\text{micro}}/\partial\log p_{b,t}=-m_{b,t}/(BCK)$。有效位置的导数为 $-1/(2\times1\times2)=-0.25$，被遮住的位置为 `0`。例如把第一个值从 `-1` 提高到 `-0.99`，loss 会减少 `0.0025`。这些梯度随后由 autograd 沿上游计算图传播到模型参数。
 
 ### 为什么必须先除 `gradient_accumulation_steps` 再 backward
 
-**核心事实**:PyTorch 里 `.backward()` 是**累加**梯度到 `.grad`,不是覆盖。
+PyTorch 的 `.backward()` 将本次梯度累加到参数 `.grad`。
 
-**关键恒等式**:对 K 个 microbatch 累积等价于对 K 份拼成的大 batch 做一次 `mean().backward()`:
+设各个 microbatch 大小相同，$L_k$ 已对第 $k$ 个 microbatch 的样本取平均。在各份损失计算一致的前提下，累积梯度满足
 
 $$
 \nabla \Big( \frac{1}{K}\sum_k L_k \Big) = \sum_k \nabla \Big( \frac{L_k}{K} \Big)
 $$
 
-所以在函数**内部**先除以 `gradient_accumulation_steps` 再反传;若在外层再除,梯度尺度会错 K 倍。
+因此，这个函数在 `backward()` 前除以 `gradient_accumulation_steps`。在反传后仅对返回的 loss 再做除法，不会改变已经累积的梯度。若各 microbatch 样本数不同，需要按样本数加权才能对应整个有效 batch 的样本平均。
 
 ### 参考实现
 
@@ -151,21 +163,25 @@ def sft_microbatch_train_step(
     gradient_accumulation_steps,
     normalize_constant=1.0,
 ):
-    # 1) per-token NLL,mask 求和,除常数 → 标量
+    batch_size = policy_log_probs.shape[0]
+    # 1) 取负得到 NLL，按 mask 求和并除以固定常数 C。
     neg_log_lik = -masked_normalize(
         policy_log_probs, response_mask,
         normalize_constant=normalize_constant, dim=None,
     )
-    # 2) 除梯度累积步数,让 K 个 microbatch 累加 == 大 batch mean
-    loss = neg_log_lik / gradient_accumulation_steps
-    # 3) 就地反传,grad 累加到参数 .grad
+    # 2) 对 B 条样本平均，得到除 K 之前用于日志的 microbatch loss。
+    unscaled_loss = neg_log_lik / batch_size
+    # 3) 除以 K 后反传，将本次梯度累加到参数 .grad。
+    loss = unscaled_loss / gradient_accumulation_steps
     loss.backward()
     metadata = {
-        "unscaled_loss": neg_log_lik.detach(),
+        "unscaled_loss": unscaled_loss.detach(),
         "n_response_tokens": response_mask.sum().detach(),
     }
     return loss, metadata
 ```
+
+`unscaled_loss` 已包含负号、$C$ 归一化和样本平均，表示除以 $K$ 前的损失。`.detach()` 保留日志数值并切断它与计算图的连接。`loss` 则是本次已经用于反传、包含 $1/K$ 缩放的值。
 
 ### 外层训练循环模板
 
@@ -187,10 +203,46 @@ optimizer.zero_grad()
 
 | 坑 | 现象 | 正确做法 |
 | --- | --- | --- |
-| 忘记加负号 | loss 一直为负、越训越负 | `-masked_normalize(...)` |
-| 用 `mask.sum()` 当分母 | 长响应权重被稀释,长度偏差 | 用固定 `normalize_constant`(见 §1) |
-| 在函数外再除以 K | 梯度尺度错 K 倍,不等价于大 batch | 函数内 `loss / K` 后 backward |
+| 忘记加负号 | loss 和梯度符号反转，优化方向降低标准答案的概率 | `-masked_normalize(...)` |
+| 混淆固定常数和有效 token 平均 | 改变整批 loss 的分母和梯度尺度 | 按此函数约定使用固定 `normalize_constant`（见 §1） |
+| 反传后只对返回 loss 除以 K | 参数中已经累积的梯度仍大 K 倍 | 函数内先 `loss / K` 再 `backward()` |
 | microbatch 循环内调 `optimizer.step()` | 退化成 K 次小 batch 更新,训练动态完全变 | `step()` 只在 K 次累加完调一次 |
+
+### 快照更新与普通验证
+
+`UPDATE_SNAPSHOTS` 由仓库的 `NumpySnapshot.assert_match` 读取。值为 `1` 时，当前输出数组会写入对应 `.npz` 文件，随后返回，跳过与旧快照的数值比较。显式设置 `force_update=True` 或快照文件缺失时，也会写入当前输出。它用于在确认新的预期结果后刷新参考数据。若当前实现有误，更新会把错误输出存成后续比较的参考值。[tests/conftest.py:71](../tests/conftest.py#L71)
+
+这个开关在本仓库中有明确的本机精度适配用途。2026-06-30 的提交 `37b5cfb` 写明它用于“方便在 Mac (bf16) 上重新生成基线”，同次提交实现了 `get_response_log_probs` 并讨论了显式 FP32 加载。模型前向使用 BF16 时，输出已经包含该精度下的舍入误差，随后对 logits 调用 `.float()` 会保留这些误差，并让后续计算使用 FP32。
+
+2026-11-13 在当前 Mac 的 CPU 上，使用相同模型、测试输入、SDPA 后端以及 `torch 2.5.1`、`transformers 5.12.1`，对照官方 `test_get_response_log_probs.npz` 得到
+
+| 模型前向精度 | log-prob 最大绝对偏差 | entropy 最大绝对偏差 | 原快照比较 |
+|---|---:|---:|---|
+| 默认 BF16 | `0.239779` | `0.167585` | 失败 |
+| 显式 FP32 | `0.00009537` | `0.00072396` | 通过 |
+
+本次 CPU 对照中，显式 FP32 前向后通过了原快照比较。当前 `tests/conftest.py` 的 model fixture 已显式使用 `dtype=torch.float32`，下方命令按此配置重建 FP32 本地参考。若要建立 BF16 基线，需要先将该 fixture 的加载精度显式改为 `dtype=torch.bfloat16`，独立确认数值正确后，再仅对 `test_get_response_log_probs` 更新，并记录模型、dtype 和运行环境。
+
+按当前 FP32 配置重建这项测试的本地基线时，运行
+
+```bash
+UPDATE_SNAPSHOTS=1 .venv/bin/python -m pytest tests/test_sft.py::test_get_response_log_probs -q
+```
+
+该命令会覆盖 `tests/_snapshots/test_get_response_log_probs.npz`，并跳过与旧参考结果的数值比较。随后保持同一模型前向配置，移除更新开关，运行同一测试，检查新本地基线能否复现
+
+```bash
+env -u UPDATE_SNAPSHOTS .venv/bin/python -m pytest tests/test_sft.py::test_get_response_log_probs -q
+```
+
+更新后通过快照比较，表示输出与该本地基线一致。基线的数值正确性由前面的独立核对建立，常规测试使用已确认的参考结果进行比较。
+
+验证这个训练步时，使用已有快照比较 loss 和输入 log-prob 的梯度。这三个测试直接构造输入张量，可以运行
+
+```bash
+env -u UPDATE_SNAPSHOTS .venv/bin/python -m pytest \
+  tests/test_sft.py -k sft_microbatch_train_step -q
+```
 
 ## 外延拓展方向
 

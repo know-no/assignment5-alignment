@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 from .adapters import (
@@ -19,6 +21,12 @@ def test_tokenize_prompt_and_output(numpy_snapshot, prompt_strs, output_strs, to
 def test_compute_entropy(numpy_snapshot, logits):
     output = compute_entropy(logits)
     numpy_snapshot.assert_match(output)
+
+
+def test_compute_entropy_large_common_offset():
+    logits = torch.full((1, 1, 3), 1e8, dtype=torch.float32)
+    expected = torch.full((1, 1), math.log(3), dtype=torch.float32)
+    torch.testing.assert_close(compute_entropy(logits), expected, rtol=1e-5, atol=1e-6)
 
 
 def test_get_response_log_probs(

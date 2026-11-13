@@ -33,13 +33,15 @@ GenerateFn = Callable[[list[str]], list[str]]
 - **单测不需要真加载模型** —— 传个返回固定字符串的桩函数就能测
 - **生成参数与日志逻辑正交** —— temperature/top_p/max_tokens 由调用方在 `generate_fn` 里封装
 
+调用回调时，日志函数会进入 `torch.no_grad()`，并将传入的 `policy_model` 临时设为 eval。正常返回或抛出异常后，各子模块的 `training` 标志都恢复到调用前的值。若回调使用独立的 vLLM 实例或另一个 HF 模型，回调负责那个模型自己的推理状态。
+
 ### 2. 熵按 `mask.sum(-1)` 逐样本平均,而不是训练用的固定常数
 
 这是 [sft-loss-normalization.md](sft-loss-normalization.md) 的对照场景。**同一个 mask+entropy 张量,两处用途、两种归一化**:
 
 | 场景 | 分母 | 目的 |
 | --- | --- | --- |
-| 训练 loss(§1) | 固定 `normalize_constant` | 消除长度偏差,让每 token 一票 |
+| 训练 loss(§1) | 固定 `normalize_constant`，再对样本平均并缩放梯度累积 | 有效 token 采用统一系数，较长回答仍可能贡献更多总损失 |
 | **日志展示(本篇)** | **`mask.sum(-1)`(每条真实响应长度)** | **给出可比较的 nats/token,人眼可读** |
 
 关键洞察:**归一化选谁,取决于你要什么样的可比性**:
@@ -47,32 +49,32 @@ GenerateFn = Callable[[list[str]], list[str]]
 - 训练要"每 token 权重一致"——所以除固定常数
 - 日志要"每条样本的平均不确定度"——所以除各自长度
 
-实现片段:
+令 `R` 为具有响应 token 的行数，这些行一起送入模型。逐行聚合的计算为
 
 ```python
-# token_entropy: (B, L),mask: (B, L)
-per_sample_sum = (token_entropy * mask).sum(dim=-1)      # (B,)
-per_sample_count = mask.sum(dim=-1).clamp_min(1.0)       # 防 0 除
-per_sample_mean = per_sample_sum / per_sample_count      # (B,) 单位是 nats/token
+# token_entropy 与 mask 的形状均为 (R, L)，每行至少有一个响应 token。
+per_sample_sum = (token_entropy * mask).sum(dim=-1)
+per_sample_count = mask.sum(dim=-1)
+per_sample_mean = per_sample_sum / per_sample_count  # (R,)，单位为 nats/token
 ```
 
 这里 `dim=-1` 是精确匹配 [sft-loss-normalization.md](sft-loss-normalization.md) §2 里"逐样本 loss"那条路径的实战案例。
 
+没有响应 token 的样本，其 `mean_token_entropy` 为 `None`，整批平均熵排除这些空值。整批响应都为空时，熵 helper 直接返回 `None` 列表并跳过模型前向。其余响应保持整批前向的计算方式，结果按原输入顺序返回。
+
 ### 3. 长度按 token 数,分桶按 `answer_reward`
 
-**长度用 token 数,不是字符数**:与训练时 mask 分母的口径一致,才能和 loss 里的"序列长度"直接对得上。
+传入 `tokenizer` 时，函数使用 `tokenizer.encode(response, add_special_tokens=False)` 统计响应字符串的 token 数。正式记录 token 长度时，调用者应传入与评分模型匹配的 tokenizer。省略 tokenizer 时，现有 API 保留 `len(response.split())` 作为近似长度，并继续存入 `response_len_tokens` 字段。
 
-**正确/错误分桶用 `answer_reward==1`,不用 `reward==1`**:
+正确响应按 `answer_reward == 1` 分桶。当前 `r1_zero_reward_fn` 的返回规则为
 
-r1_zero 的 reward 规则里(见 [drgrpo_grader.py:1008](../cs336_alignment/drgrpo_grader.py#L1008) `r1_zero_reward_fn`):
+| 响应情况 | `format_reward` | `answer_reward` | `reward` |
+|---|---:|---:|---:|
+| 格式正确且答案正确 | 1 | 1 | 1 |
+| 格式正确且答案错误 | 1 | 0 | 0 |
+| 格式错误 | 0 | 0 | 0 |
 
-```python
-if 格式对 and 答案对: reward = 1
-if 格式对 and 答案错: reward = 0   # ← 格式对没奖励,防 hacking
-if 格式错:            reward = 0
-```
-
-所以 `reward==0` 里混着"格式错"和"答案错"两类。用 `answer_reward==1` 分桶能拆出**答对了没**这个更纯的信号,`mean_correct_len` / `mean_wrong_len` 才有解释力。
+因此，这个 grader 中 `answer_reward` 与 `reward` 始终相同，格式错误也进入失败桶。即使响应字符串写出了正确数字，格式错误时这两个奖励仍为 0。`mean_correct_len` 和 `mean_wrong_len` 按当前奖励函数认可的成功与失败统计。[drgrpo_grader.py:1008](../cs336_alignment/drgrpo_grader.py#L1008)
 
 ## 记录什么、聚合什么
 
@@ -81,7 +83,7 @@ if 格式错:            reward = 0
 - `prompt` / `response` / `ground_truth`
 - `format_reward` / `answer_reward` / `reward`
 - `response_len_tokens`
-- `mean_token_entropy`(可选)
+- `mean_token_entropy`，未启用熵计算或响应没有 token 时为 `None`
 - `step`
 
 **每批 summary**(适合直接扔进 wandb / print):
@@ -91,7 +93,9 @@ if 格式错:            reward = 0
 - `mean_response_len` / `mean_correct_len` / `mean_wrong_len`
 - `mean_token_entropy`
 
-**落盘用 JSONL 追加**:一条记录一行,不用担心训练崩了丢文件,后续用 `jq` 或 `pandas.read_json(..., lines=True)` 都很顺手。
+JSONL 以追加方式保存 `records`，每条记录一行。`summary` 返回给调用者，用于 wandb 或其他聚合指标记录。
+
+`extra` 可以附加 `epoch`、`lr` 等字段。若键名与 `n`、`step` 或任一核心均值字段冲突，函数会在生成和写日志前抛出 `ValueError`。空批次仍返回完整的核心 summary 字段，`n=0`，各均值为 `None`，并保留不冲突的 `extra`。
 
 ## 训练循环里的位置
 
@@ -114,9 +118,11 @@ if global_step % log_every == 0:
 
 ## 需要留意的三个坑
 
-1. **`policy_model.eval()` + `torch.no_grad()`**:算熵的前向不能影响 dropout/BN 统计,也不需要建图。函数里用 try/finally 恢复原状态,避免污染训练模式。
-2. **empty list**:某批可能全对或全错,`fmean([])` 会抛异常;用 `_safe_mean` 返回 `None`,让下游(wandb)自己处理缺失。
-3. **响应里的特殊 token**:vllm 通常已经去了 EOS,但 HF `generate` 输出可能带。落盘前若要展示,记得 `tokenizer.decode(..., skip_special_tokens=True)`;算长度时反过来——**要包含 EOS**,因为 EOS 也是模型学出来的 token,和 loss 口径一致。
+1. 生成与熵前向都在 `policy_model.eval()` 和 `torch.no_grad()` 下运行。进入时保存所有子模块的 `training` 标志，退出时逐个恢复，因此原先处于 eval 的子模块也能保持自己的状态。
+2. 某批可能全对或全错，对应空桶由 `_safe_mean` 返回 `None`。空响应的熵也为 `None`，其余有效样本照常参与整批熵均值。
+3. 长度统计以回调返回的响应字符串为准。HF 回调应从生成序列中取出响应部分，特殊 token 的保留方式需要与日志口径一致。已从字符串中移除的 EOS 无法由重新编码自动恢复。
+
+`compute_entropy.py` 已在 shifted 域使用 `shifted - log(sum_exp)` 计算 log-prob，修复 FP32 下共同大偏移引起的舍入问题。`test_compute_entropy_large_common_offset` 用 `[1e8, 1e8, 1e8]` 验证熵为 `log(3)`，当前日志调用复用这个实现。
 
 ## 外延拓展方向
 

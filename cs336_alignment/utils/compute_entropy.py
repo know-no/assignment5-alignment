@@ -20,9 +20,14 @@ def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
     sum_exp = torch.sum(exp_shifted, dim=-1, keepdim=True)
     log_z = v_max + torch.log(sum_exp)  # (..., 1) z 是 sumexp 的值
 
-    # log p = logits - log_z；p = exp(log p)； logits是nn.Linear 的输出，有正有负，不是概率, 它把【0，1】的概率映射到了-infinity，+infinity的实数轴
-    # 可以理解成"未归一化的对数概率"——它正比于 $\log p$，但差一个常数 $\log Z$： {logits}_i = log p_i + log Z
-    log_probs = logits - log_z # 把"未归一化分数"减掉归一化常数，才变成真正的对数概率; 回归到log 运算内的除法，则是缩放
+    # logits 是模型输出的实数分数。对同一位置，所有词表项共享归一化常数 log_z。
+    # log p_i = logits_i - log_z，对应 p_i = exp(logits_i) / sum_j exp(logits_j)。
+    # log_probs = logits - log_z
+    # probs = exp_shifted / sum_exp  # 等价于 softmax，复用已算的 exp_shifted
+
+    # 当 logits 带有很大的共同偏移时，计算 log_z 会把较小的归一化项舍入掉，得到错误的 log-prob,比如 logits = [1e8, 1e8, 1e8]; 当 v_max=1e8 时，加上的 log(3)≈1.0986 可能被 FP32 舍入掉，随后相减就错误地得到 0。
+    # 所以，可以直接
+    log_probs = shifted - torch.log(sum_exp)
     probs = exp_shifted / sum_exp  # 等价于 softmax，复用已算的 exp_shifted
 
     # H(p) = -sum p * log p
@@ -71,16 +76,18 @@ def get_response_log_probs(
         input_ids: torch.Tensor 形状为 (batch_size, sequence_length)，由你的分词方法产生的连接后的提示+响应 token。
         labels: torch.Tensor 形状为 (batch_size, sequence_length)，由你的分词方法产生的标签。
         return_token_entropy: bool 如果为 True，则通过调用 compute_entropy 也返回每 token 熵。
-        我在 tokenizer_utils 里实现的分词方法，是右移的， hf 里实现的是左移的; sequence_length 是 input_id 的 size，input_id 是原始 input 的 size-1;
-        见 tokenizer_utils.py 里，input id 去掉了最后一个值; 但是这里的sequence_length实际上指的是，去掉最后一个值之后的长度
+        分词阶段已将 input_ids 设为拼接序列的 [:-1]，labels 设为 [1:]。
+        因而 input_ids 位置 t 的模型输出与 labels 位置 t 的下一个 token 已对齐。
     Returns:
         dict[str, torch.Tensor]。
         "log_probs" 形状为 (batch_size, sequence_length)，条件对数概率 log pθ(xt | x<t)。
         "token_entropy" 可选，形状为 (batch_size, sequence_length)，每个位置的每 token 熵（如果 return_token_entropy=True 则存在）。
     """
-    logits = model(input_ids).logits .float() # (B, L, V) V是 vocabulary 的 size # 使用 float 上溢，计算过程是正确的，但是结果不对,加了顺便让 bf16 模型输出能转 numpy（snapshot 测试用）； 直接改模型加载参数类型也可以过测试；
+    # 将前向输出转为 float32，供后续 log_softmax、熵计算和 NumPy 快照比较使用。
+    logits = model(input_ids).logits.float()  # (B, L, V)，V 是词表大小。
     log_probs_all = F.log_softmax(logits, -1) # (B, L, V)
-    # log_probs_all.gather 是 torch 里面【按索引取值】操作，在这里是：从每个位置的整个词表分布里，挑选出真实 label 那个 token 对应的 log 概率
+    # labels 保存标准答案 token 的索引，从每个位置的词表分布中取出它的 log-prob。
+    # 后续 SFT 训练步对这些值取负，即得到 one-hot 目标的逐 token 交叉熵。
     log_probs = log_probs_all.gather(
         -1, labels.unsqueeze(-1) 
     ).squeeze(-1) # (B, L)
