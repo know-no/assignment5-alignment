@@ -72,9 +72,15 @@ def get_response_log_probs(
 ) -> dict[str, torch.Tensor]:
     """
     Args:
-        model: PreTrainedModel 用于评分的 HuggingFace 模型（放置在正确的设备上，并在不需要计算梯度时处于推理模式）。
+        model: PreTrainedModel 用于评分的 HuggingFace 模型，需放置在正确的设备上。
+            调用方分别控制 train/eval 模式与是否记录梯度；本函数不会主动切换模式或关闭梯度记录。
         input_ids: torch.Tensor 形状为 (batch_size, sequence_length)，由你的分词方法产生的连接后的提示+响应 token。
-        labels: torch.Tensor 形状为 (batch_size, sequence_length)，由你的分词方法产生的标签。
+        labels: torch.Tensor 形状为 (batch_size, sequence_length)，由完整“提示+回答”token 序列取 [1:] 得到。
+            其中参与回答损失的 token，在 SFT 中来自数据集标准回答；
+            在 GRPO 中来自模型采样的 rollout 回答，可能包含错误答案。
+            例如题目“1+1”的标准答案为“2”，若 rollout 生成“3”，就对“3”的 token 计算 log-prob。
+            GRPO 的 ground_truths 用于奖励函数判分，不直接替换 rollout 对应的 labels；
+            后续损失通过 response_mask 选中回答位置，再结合奖励或优势决定如何调整概率。
         return_token_entropy: bool 如果为 True，则通过调用 compute_entropy 也返回每 token 熵。
         分词阶段已将 input_ids 设为拼接序列的 [:-1]，labels 设为 [1:]。
         因而 input_ids 位置 t 的模型输出与 labels 位置 t 的下一个 token 已对齐。
@@ -86,7 +92,7 @@ def get_response_log_probs(
     # 将前向输出转为 float32，供后续 log_softmax、熵计算和 NumPy 快照比较使用。
     logits = model(input_ids).logits.float()  # (B, L, V)，V 是词表大小。
     log_probs_all = F.log_softmax(logits, -1) # (B, L, V)
-    # labels 保存标准答案 token 的索引，从每个位置的词表分布中取出它的 log-prob。
+    # labels 指定本次要评分的 token，从每个位置的词表分布中取出它的 log-prob。
     # 后续 SFT 训练步对这些值取负，即得到 one-hot 目标的逐 token 交叉熵。
     log_probs = log_probs_all.gather(
         -1, labels.unsqueeze(-1) 
