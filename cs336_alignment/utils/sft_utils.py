@@ -2,6 +2,9 @@
 import torch
 
 from cs336_alignment.utils import compute_entropy
+from transformers import PreTrainedTokenizerBase
+from cs336_alignment.utils.tokenizer_utils import tokenize_prompt_and_output
+from cs336_alignment.utils.compute_entropy import get_response_log_probs
 
 
 # UPDATE_SNAPSHOTS=1 会将当前输出保存为新的 .npz 参考值。
@@ -65,6 +68,69 @@ def sft_microbatch_train_step(
         "n_response_tokens": response_mask.sum().detach(),
     }
     return loss, metadata
+
+
+
+def sft_optimizer_step(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    tokenizer: PreTrainedTokenizerBase,
+    prompt_strs: list[str],
+    output_strs: list[str],
+    microbatch_size : int,
+    normalize_constant: float = 1.0,
+    max_grad_norm: float = 1.0
+) -> dict[str, float]:
+    model.train()
+    optimizer.zero_grad()
+
+    losses = []
+    for i in range(0, len(prompt_strs), microbatch_size):
+        if i + microbatch_size > len(prompt_strs):
+            break # 不符合micro batch的我就丢掉吧
+        batch = tokenize_prompt_and_output(
+            prompt_strs=prompt_strs[i:i + microbatch_size],
+            output_strs=output_strs[i:i + microbatch_size],
+            tokenizer=tokenizer)
+        device = next(model.parameters()).device
+        input_ids = batch["input_ids"].to(device)
+        labels = batch["labels"].to(device)
+        response_mask = batch["response_mask"].to(device)
+
+        result = compute_entropy.get_response_log_probs(
+            model=model,
+            input_ids=input_ids,
+            labels=labels,
+            return_token_entropy=True,
+        )
+        policy_log_probs = result["log_probs"] # (B, L)
+        token_entropy = result["token_entropy"]
+
+        sft_result : tuple[torch.Tensor, dict[str, torch.Tensor]] = sft_microbatch_train_step(
+            policy_log_probs=policy_log_probs,
+            response_mask=response_mask,
+            gradient_accumulation_steps = len(prompt_strs) // microbatch_size,
+            normalize_constant=normalize_constant,
+        )
+        loss:torch.Tensor = sft_result[0]
+        metadata : dict[str, torch.Tensor] = sft_result[1]
+        unscaled_loss:torch.Tensor = metadata["unscaled_loss"]
+        n_response_tokens:  torch.Tensor = metadata["n_response_tokens"]
+        losses.append(loss)
+
+    batch_loss = sum([loss.detach().item() for loss in losses])
+    print(f'batch loss: {batch_loss}')
+
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(),
+        max_norm=max_grad_norm,
+        norm_type=2.0,
+        )
+    optimizer.step()
+    return {
+        "loss": batch_loss,
+        "grad_norm_before_clip": grad_norm.item(),
+    }
 
 
 
