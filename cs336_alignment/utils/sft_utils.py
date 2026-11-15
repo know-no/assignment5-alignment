@@ -1,3 +1,5 @@
+import json
+import random
 
 import torch
 
@@ -134,3 +136,70 @@ def sft_optimizer_step(
 
 
 
+
+def load_sft_data(path: str) -> tuple[list[str], list[str]]:
+    prompts = []
+    responses = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for line_number, content in enumerate(f, start=1):
+            if not content.strip():
+                continue
+            try:
+                record = json.loads(content)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"{path} 第 {line_number} 行包含无效 JSON") from error
+            if not isinstance(record, dict) or not all(
+                isinstance(record.get(field), str) for field in ("prompt", "response")
+            ):
+                raise ValueError(f"{path} 第 {line_number} 行需要字符串字段 prompt 和 response")
+            prompts.append(record["prompt"])
+            responses.append(record["response"])
+    return prompts, responses
+
+def sft_train_loop(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    tokenizer: PreTrainedTokenizerBase,
+    prompt_strs: list[str],
+    output_strs: list[str],
+    num_epochs: int,
+    batch_size: int,
+    microbatch_size: int,
+) -> list[dict[str, float]]:
+    if len(prompt_strs) != len(output_strs):
+        raise ValueError("prompt_strs 与 output_strs 长度必须一致")
+    for name, value in (
+        ("batch_size", batch_size),
+        ("microbatch_size", microbatch_size),
+        ("num_epochs", num_epochs),
+    ):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} 必须为正整数")
+    if batch_size % microbatch_size != 0:
+        raise ValueError("batch_size 必须能被 microbatch_size 整除")
+    if len(prompt_strs) < batch_size:
+        raise ValueError("训练数据至少需要一个完整 batch")
+
+    rng = random.Random(42)
+    history = []
+    for epoch in range(0, num_epochs):
+        indices = list(range(len(prompt_strs)))
+        rng.shuffle(indices)
+        for start in range(0, len(indices), batch_size):
+            batch_indices = indices[start: start+batch_size]
+
+            if (len(batch_indices) < batch_size):
+                break
+            batch_prompts = [prompt_strs[i] for i in batch_indices]
+            batch_outputs = [output_strs[i] for i in batch_indices]
+
+            sft_result = sft_optimizer_step(
+                model=model,
+                optimizer=optimizer,
+                tokenizer=tokenizer,
+                prompt_strs=batch_prompts,
+                output_strs=batch_outputs,
+                microbatch_size=microbatch_size,
+            )
+            history.append(sft_result)
+    return history
