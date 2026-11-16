@@ -1,247 +1,139 @@
-# Assignment 5 (Alignment) 个人执行计划
+# Assignment 5 (Alignment) 个人自学计划
 
-## 目标
+## 目标与验收口径
 
-完成 CS336 Assignment 5（MATH 数据集上的 SFT / Expert Iteration / GRPO），
-**本机 (Mac M2) 继续实现和验证代码，使用现有的 1 张 H20 分阶段开展训练与评估。**
+当前目标是通过本地代码实践和指导学习，理解 MATH 上的 SFT、Expert Iteration、GRPO 及其消融方法。当前没有可用训练卡，使用本机 CPU/MPS 做小模型验证。
 
-主作业全部 26 个 Problem 均纳入完成范围，包括 Off-policy GRPO 和 Leaderboard。Safety/RLHF 补充作业作为可开展的支线，优先完成 MATH 主线，再按资源安排补充实验。
+个人验收分为两条路线。代码部分由用户自己实现，以张量小例、定向测试和 tiny 模型的真实生成、反传、参数更新验证机制。实验部分通过讲义、可核实的已发表结论和案例指导，学习实验设计、曲线解读与结论边界，无需亲跑全部正式实验。
+
+正式课程的 26 题要求保留为对照。当前按整题交付口径，#2–7、#10–15 共 **12 题完成**，另 **14 题尚未完整交付**。其中 #16 的基础训练循环已经实现，正式 MATH 训练奖励曲线和生成样例仍缺。个人自学按下文的机制理解、代码实践和分析能力验收，完整课程复现留作以后可选的目标。
 
 ## 当前进度与资源
 
-- 基础工具基线为 `45e7df3`。SFT 六个基础题（题号 2-7）已完成，本机 SFT 与日志相关测试共 **24 项通过**，包括真实微型 HF causal LM 的 FP32/BF16 生成、反传、梯度累积、日志与参数更新衔接。
-- `sft_optimizer_step` 已实现，一次调用完成有效 batch 的微批累积、梯度裁剪和参数更新。新增 4 项 CPU FP32 整批对照测试，与原 3 项微批测试组成的定向回归共 **7 项通过**，完整多 step 训练入口仍待实现。
-- 主作业仍有 **20 项未完整交付**，包括正式 MATH baseline、完整训练入口、训练实验、消融及书面结果。现有 baseline 产物是 GSM8K 的 10 条调试样本。
-- GRPO 的 14 项测试因基础函数尚未实现而失败。另有 7 项失败属于可选 Safety/RLHF 补充作业，对应 5 个 adapter。
-- GPU 资源为 **1 × H20，尚未启动**。显存、驱动、CUDA、PyTorch/vLLM 环境、可用存储和运行性能均待启动后核对。
-- 按当前阶段需要的功能推进即可先开展 baseline 和 SFT，GRPO 与可选题的实现继续在本机完成。
+- 当前代码基线为 `5fca333`，分支为 `feature/my-work-2025`。
+- SFT 基础题 #2–7 已完成。已有 `sft_optimizer_step`、多 epoch 训练循环，以及支持模型/数据路径、batch、microbatch、学习率、设备和 FP32/BF16 的 CLI。训练返回 history，入口打印配置和逐步指标。
+- GRPO 基础题 #10–15 已完成。#16 已具备生成回答、整组评分与优势、编码、缓存 old log-prob、微批累积、梯度裁剪、参数更新和 history 的衔接。当前每批新回答只做一次 optimizer 更新，同批复用的 #22 尚未实现。
+- 最新离线定向回归共 **61 项通过**，含本地 Qwen 的 FP32 评分、CPU FP32/BF16 tiny 模型训练、MPS 迁移和真实 HF generate。这些验证覆盖代码的数值与衔接，正式 MATH 实验状态单独记录。
+- 本地产物仍只有 GSM8K 的 10 条 baseline 调试样本。正式 MATH baseline、SFT/EI/GRPO 训练实验、checkpoint、实验曲线和 `writeup.pdf` 尚未交付。EI 尚无完整流程。正式 MATH 错误分析已暂缓。
+- `log_generations` 已实现并有训练衔接测试，普通 SFT/GRPO 循环尚未接入训练内采样日志、周期验证及保存恢复。是否补这些工程功能，按后续本地学习需要选择。
+- Safety/RLHF 补充支线的 5 个 adapter 尚未实现，对应 7 个可选用例，作为独立选学内容记录。
 
----
-
-## 策略总览
-
-| 阶段 | 在哪里做 | 目标 | 验收依据 |
-|---|---|---|---|
-| 阶段 1：本机继续实现 | Mac | 补完整训练 loop、MATH 数据读取及后续 GRPO 基础函数 | 当前阶段的定向测试与微型模型验证 |
-| 阶段 2：H20 环境小验证 | 单张 H20 | 核对环境，运行短生成、评分及少量训练步骤 | 实际设备信息、有限 loss/梯度、checkpoint 保存与恢复 |
-| 阶段 3：主线实验 | 单张 H20 | MATH baseline → SFT → EI → GRPO/消融/off-policy → Leaderboard 实验 | 完整验证集指标、曲线、配置与硬件记录 |
-| 阶段 4：结果与交付 | Mac | 分析结果、画图、写报告并整理代码 | `writeup.pdf`、代码及可追溯实验产物 |
-
----
-
-## 任务拆解（按 PDF 中的 Problem 列出）
-
-主讲义共 26 个 Problem，其中 25 个标分项合计 66 分，`grpo_off_policy` 未单独标分。表中的 `H100 hrs` 保留讲义参考预算，H20 的实际用时在运行后记录。
-
-### Part 1: Zero-shot MATH Baseline（§3）
-
-| # | Problem | 分值 | GPU? | Mac 可做? |
-|---|---|---|---|---|
-| 1 | `math_baseline` | 4 | 推理 | 已跑通 GSM8K 10 条调试，正式 MATH 评估待补 |
-
-产出物包括正式 MATH 验证集评估脚本、样本与分数、三种奖励桶的数量以及准确率。对格式错误、格式正确但答案错误这两类，各分析至少 10 个案例，并展示三类响应的代表例子。
-
-### Part 2: SFT (§4 / Supervised Finetuning)
-
-| # | Problem | 分值 | 实现位置 |
-|---|---|---|---|
-| 2 | `tokenize_prompt_and_output` | 2 | `tests/adapters.py` |
-| 3 | `compute_entropy` | 1 | `tests/adapters.py` |
-| 4 | `get_response_log_probs` | 2 | `tests/adapters.py` |
-| 5 | `masked_normalize` | 1 | `tests/adapters.py` |
-| 6 | `sft_microbatch_train_step` | 3 | `tests/adapters.py` |
-| 7 | `log_generations` | 1 | `cs336_alignment/utils/log_utils.py` |
-| 8 | `sft_experiment` | 2 | **2 H100 hrs** — GPU 跑 SFT 完整训练 |
-
-题号 2-7 已完成并接入测试。下一步在本机补完整 SFT 训练入口，再到单张 H20 做短运行和正式实验。题号 8 需要比较数据规模 `{128, 256, 512, 1024}` 与全量数据，目标是全量 SFT 验证准确率至少 15%，并补做仅保留答案正确样本的全量过滤实验，报告过滤后数据量及验证曲线。
-
-### Part 3: Expert Iteration (§5)
-
-| # | Problem | 分值 | GPU? |
-|---|---|---|---|
-| 9 | `expert_iteration_experiment` | 2 | **6 H100 hrs** |
-
-在本机实现采样、过滤和迭代脚本，单张 H20 上顺序运行生成与训练。按讲义做 5 轮 EI，比较至少两种 rollout 数和 SFT epoch 数，并比较每轮题目批量 `{512, 1024, 2048}` 中的配置，保留验证曲线与响应熵曲线，目标验证准确率至少 15%。
-
-### Part 4: GRPO 基础 (§7)
-
-| # | Problem | 分值 | 实现位置 |
-|---|---|---|---|
-| 10 | `compute_group_normalized_rewards` | 2 | `tests/adapters.py` |
-| 11 | `compute_naive_policy_gradient_loss` | 1 | `tests/adapters.py` |
-| 12 | `compute_grpo_clip_loss` | 2 | `tests/adapters.py` |
-| 13 | `compute_policy_gradient_loss` | 1 | `tests/adapters.py` |
-| 14 | `masked_mean` | 1 | `tests/adapters.py` |
-| 15 | `grpo_microbatch_train_step` | 3 | `tests/adapters.py` |
-| 16 | `grpo_train_loop` | 5 | 训练 loop 脚本（不只是 adapter） |
-
-在本机完成题号 10-15 的 6 个基础函数及题号 16 的训练 loop，先验证对应的 14 项单测，再在 H20 上检查短训练的奖励、梯度及生成样本。
-
-### Part 5: GRPO 实验与消融 (§8)
-
-| # | Problem | 分值 | GPU? |
-|---|---|---|---|
-| 17 | `grpo_learning_rate` | 2 | **6 H100 hrs** |
-| 18 | `grpo_baselines` | 2 | **2 H100 hrs** |
-| 19 | `think_about_length_normalization` | 1 | 纯思考题 |
-| 20 | `grpo_length_normalization` | 2 | **2 H100 hrs** |
-| 21 | `grpo_group_standard_deviation` | 2 | **2 H100 hrs** |
-
-### Part 6: Off-policy GRPO（§8 续）
-
-| # | Problem | 分值 | GPU? |
-|---|---|---|---|
-| 22 | `grpo_off_policy`（实现） | 未单独标分 | Mac 写代码，H20 验证 |
-| 23 | `grpo_off_policy_sweep` | 4 | **12 H100 hrs** |
-| 24 | `grpo_off_policy_clip_ablation` | 2 | **2 H100 hrs** |
-| 25 | `grpo_prompt_ablation` | 2 | **2 H100 hrs** |
-
-### Part 7: Leaderboard（§9）
-
-| # | Problem | 分值 | GPU? |
-|---|---|---|---|
-| 26 | `leaderboard` | 16 | **16 H100 hrs** |
-
-正式讲义要求报告 **2 张 H100 上、4 小时训练内**获得的结果，并在整个 MATH 验证集（5000 题）上按规定的 R1-Zero prompt、`temperature=1.0`、`max_tokens=1024` 和原始 `r1_zero_reward_fn` 评估。当前可先用单张 H20 开展算法实验，报告实际硬件与耗时。正式双 H100 预算下的结果需要另行安排资源验证。
-
----
-
-### 算力预算汇总
-
-| 类型 | 分值与范围 | 讲义 H100 参考小时 |
+| 验证文件 | 最新通过数 | 主要覆盖 |
 |---|---|---|
-| 代码与训练 loop | **25 分**，题号 2-7、10-16 | 代码可在本机实现，loop 仍需运行验证 |
-| 评估与实验 | 40 分，题号 1、8、9、17、18、20、21、23-26 | **52 H100 小时**，按有标注的题目合计，含 Leaderboard 的 16 小时 |
-| 纯思考题 | 1 分，题号 19 | 无训练预算标注 |
+| `tests/test_sft.py` | 11 | SFT 基础张量运算、评分、熵与微批反传 |
+| `tests/test_logging.py` | 13 | 采样日志、空响应、模式恢复及 tiny FP32/BF16 训练衔接 |
+| `tests/test_sft_optimizer_step.py` | 4 | 微批累积与整批对照、裁剪及丢尾 |
+| `tests/test_train_sft.py` | 12 | 离线 CLI、多 epoch、FP32/BF16 更新及输入检查 |
+| `tests/test_grpo.py` | 14 | GRPO 基础损失、组内优势、mask 与微批训练步 |
+| `tests/test_train_grpo.py` | 7 | 三种 loss 的两轮更新、空回答保护、MPS 和 tiny HF generate |
 
-H100 小时是讲义参考预算。单张 H20 的吞吐、显存需求和实际工时，需要在启动后用当前脚本测量，再决定 batch size 和实验排期。
+## 26 题索引与个人处理方式
 
-题号 22-26 均属于主作业。主讲义第 33 页明确将 Leaderboard 称为 mandatory assignment 的最后一部分。分阶段推进时可以后做，完整交付仍需包含这些题目。
+下表保留主讲义题号。实现完成、正式实验交付和个人学习安排分别记录，避免用测试用例数量代替课程题目数量。
 
-### Safety/RLHF 可选支线
+### #1–9　Baseline、SFT 与 Expert Iteration
 
-单独的补充讲义包含 16 个 Problem，学习顺序为
+| # | Problem | 当前状态 | 个人处理方式 |
+|---|---|---|---|
+| 1 | `math_baseline` | 评估/分桶工具已实现，已有 GSM8K 10 条调试，正式 MATH 未交付 | 指导学习评估口径、三桶、准确率和错误分析方法。全量运行及正式错误案例报告暂缓 |
+| 2 | `tokenize_prompt_and_output` | 完成 | 保留本地实现与测试，作为后续训练输入基础 |
+| 3 | `compute_entropy` | 完成 | 保留数值边界回归与熵的解释 |
+| 4 | `get_response_log_probs` | 完成 | 保留逐 token 评分、labels 对齐与测试 |
+| 5 | `masked_normalize` | 完成 | 在长度归一化学习中复用固定常数与 mask 的知识 |
+| 6 | `sft_microbatch_train_step` | 完成 | 保留微批归约、反传与梯度累积验证 |
+| 7 | `log_generations` | 完成 | 保留日志工具与 tiny 训练衔接验证，普通循环接入按需选做 |
+| 8 | `sft_experiment` | 训练 CLI 与 loop 已有，正式规模/过滤实验未做 | 指导学习数据规模、质量过滤和验证曲线，无需亲跑完整矩阵 |
+| 9 | `expert_iteration_experiment` | 尚无完整 EI 流程与实验 | 指导学习采样→判分过滤→SFT→重新采样的迭代机制与分析方法，本地流程实践后续可选 |
 
-```text
-Llama 3.1 8B Base 四项基线
-  → UltraChat-200K + SafetyTunedLlamas 指令 SFT
-  → 四项重评与 red teaming
-  → Anthropic HH chosen/rejected 偏好对上的 DPO
-  → 再评估
-```
+### #10–16　GRPO 基础与训练循环
 
-四项评估为 MMLU、GSM8K、AlpacaEval 和 SimpleSafetyTests。传统 reward model、PPO/RLHF 作为背景，补充作业实际要求实现和运行的偏好训练算法是 DPO。
+| # | Problem | 当前状态 | 个人处理方式 |
+|---|---|---|---|
+| 10 | `compute_group_normalized_rewards` | 完成 | 保留完整回答组计算 reward/advantage 的实现与测试 |
+| 11 | `compute_naive_policy_gradient_loss` | 完成 | 保留固定回答权重向 token 广播的实现与测试 |
+| 12 | `compute_grpo_clip_loss` | 完成，已讨论 min/clamp、优势符号与梯度 | 作为用户指定的原理复习项，结合已有图与数值例子继续巩固 |
+| 13 | `compute_policy_gradient_loss` | 完成 | 保留不同 loss 分支选择的实现与测试 |
+| 14 | `masked_mean` | 完成 | 保留 token 轴与 batch 轴归约的实现与测试 |
+| 15 | `grpo_microbatch_train_step` | 完成 | 保留每条回答 token 均值→batch 均值→除以 K 的反传验证 |
+| 16 | `grpo_train_loop` | 基础循环与 7 项训练回归已实现，正式 MATH reward 曲线和样例未交付 | 本地代码成果已具备，接下来指导分析训练 reward、验证表现与样例之间的关系 |
 
-- 本机可先完成 packed SFT dataset、batch 迭代、MMLU parser、GSM8K parser 和 DPO loss 这 5 个 adapter，对应当前未实现的 7 项测试。
-- 补充训练使用 8B 模型。DPO 需要训练 policy 并使用冻结 reference，先在启动后的 H20 上用小 microbatch 验证实际显存与反传，再安排完整实验。
-- AlpacaEval 和 SimpleSafetyTests 的讲义原方案使用 Llama 3.3 70B Instruct 评审，要求 2 张 GPU、每张显存大于 80GB。这个评审环节的资源或方案需单独安排。
-- 补充讲义的 SFT 实验标注 24 H100 小时参考预算，独立于主线的 52 H100 小时。各项 H20 实际用时均在运行后记录。
+### #17–26　实验、消融、Off-policy 与 Leaderboard
 
----
+| # | Problem | 当前状态 | 个人处理方式 |
+|---|---|---|---|
+| 17 | `grpo_learning_rate` | 正式实验未做 | 后续待选，学习范围或实测范围按后续目标确定 |
+| 18 | `grpo_baselines` | 损失分支已有，正式对比实验未做 | 指导学习 baseline 的作用、估计噪声与公平对比方法 |
+| 19 | `think_about_length_normalization` | 思考与分析尚待系统整理 | 指导推导长度权重，用短/长回答小例解释目标差异和条件 |
+| 20 | `grpo_length_normalization` | 正式归一化对比实验未做 | 指导比较不同归约的梯度尺度、长度权重及曲线读法 |
+| 21 | `grpo_group_standard_deviation` | 开关已有，正式消融实验未做 | 指导学习组内标准差归一化的机制与消融分析 |
+| 22 | `grpo_off_policy` | 同批回答多次 optimizer 更新尚未实现 | **本地下一步，指导用户自己实现并用小模型验证** |
+| 23 | `grpo_off_policy_sweep` | 正式 sweep 未做 | 后续待选，完成 #22 后再决定学习或实践范围 |
+| 24 | `grpo_off_policy_clip_ablation` | 正式消融未做 | 后续待选，学习重点是 Clip 与 No-Clip 的对照设计 |
+| 25 | `grpo_prompt_ablation` | 正式 prompt 消融未做 | 后续待选，学习重点是 prompt 与配套奖励设置的对照 |
+| 26 | `leaderboard` | 未做 | 正式讲义属于主作业，个人自学选做，当前保留挑战内容与评估协议的理解 |
 
-## 环境配置
+正式讲义的 #26 要求在 2 张 H100、4 小时训练约束下报告结果，是综合前面算法、在固定预算内提高 MATH 成绩的挑战。个人自学以理解与代码实践验收，竞榜、排名和官方硬件预算列为选做。以后如主动选择完整复现，再单独安排对应实验。
 
-### 本机（Mac，已配置好）
+主讲义 25 个标分项合计 66 分，#22 未单独标分。讲义标注的实验预算合计 52 H100 参考小时，含 Leaderboard 的 16 小时，属于课程背景，不作为当前执行前提，也不换算成本机或其他硬件的实测工时。
+
+## 本地下一步　指导实现 #22
+
+沿用现有训练循环与优化器步，由用户添加同批 rollout 的复用层，助手负责原理解释、代码检查和验证。[grpo_train_loop](cs336_alignment/train_grpo.py#L169)、[grpo_optimizer_step](cs336_alignment/train_grpo.py#L74)
+
+- 默认 `updates_per_rollout_batch=1`，保持现有单批单次更新行为。
+- `num_steps` 表示总 optimizer 更新次数。新增复用层后区分 rollout 批次计数与更新计数，达到总更新数就结束。
+- 每批回答只生成、评分、计算优势并缓存 old log-prob 一次。同批复用期间回答、reward、advantage 和 old 分数固定。
+- 每次更新重新计算带图的 current log-prob，清梯度，完成 K 个微批反传后再裁剪和 step。step 继续放在微批循环之外。
+- 用本地可控小例检查第二次更新的 ratio、裁剪分支、参数变化及 history，核对默认值的行为保持一致。
+
+验收时应能指出哪些量每个 rollout 刷新、哪些量每次更新刷新，并解释首次 ratio 接近 1 和后续可能偏离的条件。小例通过后再决定是否增加保存恢复、训练内采样日志或普通 GRPO CLI。
+
+## 指导学习实验的路线与验收
+
+用户指定的 #1、8、9、16、12、18、20、21、19 按下表衔接。#12 保持已实现、已学习状态，承担原理复习，不替换成其他题号。
+
+| 学习单元 | 要回答的机制问题 | 可验收内容 |
+|---|---|---|
+| #1 Baseline | 如何定义一次评估，格式与答案奖励分别衡量什么 | 能用小例统计三桶和准确率，说明采样设置、数据划分及错误案例的分析方法 |
+| #8 SFT | 数据规模与数据质量怎样分别设计对照 | 能设计 `{128,256,512,1024}` 与全量数据、正确性过滤的比较，指出训练步数/epoch、过滤后数据量与验证集等混杂因素 |
+| #9 EI | 为什么要重新采样、过滤和训练，每轮哪些数据与模型发生变化 | 能追踪至少两轮模型→回答→过滤数据→新模型，说明 rollout 数、SFT epoch、题目批量会影响什么，理解讲义五轮比较的目的 |
+| #16 + #12 训练与 Clip | 完整回答奖励如何变成 token 梯度，单次更新与同批复用有何区别 | 能结合已有代码画更新顺序，计算 A 正负下的 min/clamp 分支与参数更新，分析 reward 曲线和验证准确率不同步的可能原因 |
+| #18 Baseline 消融 | 减去组均值改变了什么，如何判断对比是否公平 | 能给出含固定奖励/优势的小例，区分单批梯度与跨采样的估计性质，列出对照需固定的条件 |
+| #20 + #19 长度归一化 | token 均值、回答均值和固定常数分别给哪些项加权 | 能推导并计算长短回答的权重，读长度/熵/奖励曲线时识别归约和梯度尺度的影响，不笼统断言某一归约完全消除长度偏差 |
+| #21 标准差消融 | 除以组内标准差怎样改变组间信号尺度 | 能比较同奖励差、不同组标准差的小例，说明零方差组与 eps 的作用，提出固定其他变量的比较方法 |
+
+每个单元都应落到机制解释、小例计算、曲线或案例分析以及带条件的结论。使用公开材料时记录模型、数据、训练预算和评估配置，再判断结论能否迁移到本项目。
+
+分析中明确区分三种证据。数学结论由公式与假设推导，公开实测发现必须对应可核实的来源和实验条件，教学假设或示意曲线显式标注。当前没有正式 MATH accuracy 或训练曲线，不把讲义目标、论文数值或教学图当成本项目实测结果。正式 MATH 全量错误分析继续暂缓，不作为后续代码学习的前置。
+
+## 本地环境与验证方式
+
+现有项目 `.venv` 用于本地代码和测试，按改动范围运行定向检查。最近一次 61 项回归的范围为
 
 ```sh
-uv sync          # 装核心依赖，跳过 GPU-only 包
+env -u UPDATE_SNAPSHOTS HF_HUB_OFFLINE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  .venv/bin/python -m pytest \
+  tests/test_sft.py tests/test_logging.py tests/test_sft_optimizer_step.py \
+  tests/test_train_sft.py tests/test_grpo.py tests/test_train_grpo.py -q
 ```
 
-### 单张 H20（启动后核对）
+历史推理调试使用独立的 `~/.venv-vllm-metal/` 环境。当前 baseline 入口仍配置 GSM8K 10 条与 Mac 调试模型，正式 MATH 入口尚待替换。[math_baseline.py](cs336_alignment/math_baseline.py#L24)
 
-启动后先记录设备型号和显存、驱动/CUDA、Python、PyTorch、vLLM、FlashAttention 版本，以及模型和数据所在位置、可持久化存储路径。当前 GPU 还未启动，这些环境信息均待确认。
+如后续恢复训练卡资源，再按实际设备核对依赖、模型、数据、显存和持久化存储。先做短生成、评分、有限 loss/梯度与参数更新验证，再按需补 checkpoint 保存恢复和所选正式实验，不预设卡型、吞吐或排期。
 
-项目的 `gpu` 可选依赖组提供 `vllm==0.7.2` 与 `flash-attn==2.7.4.post1` 作为环境配置起点。先核对 H20 的实际软件环境与依赖兼容性，再安装所需依赖并做短运行验证。
+## 后续待选
 
----
+#17、23–25 保持待选状态。可先通过指导阅读设计和结果学习，再决定是否亲自复现。后续算力安排服务于主动选择的实验。
 
-## Mac 与 GPU 调试环境
+Safety/RLHF 是独立的可选补充，共 16 题。可选的本地练习包括 packed dataset、batch 迭代、MMLU/GSM8K parser 与 DPO loss 的 5 个 adapter，当前留待以后选择。
 
-- 本机项目 `.venv` 用于代码和单元测试，独立的 `~/.venv-vllm-metal/` 用于 Mac 上的 vLLM 推理调试。本次已验证后者可以导入 `LLM`、`SamplingParams` 并激活 Metal 插件。
-- 既有 Mac baseline 采用 `mlx-community/Qwen2.5-Math-1.5B-bf16` 和 GSM8K 10 条样本。正式迁移时改为 MATH 数据及 `Qwen/Qwen2.5-Math-1.5B`，核对采样配置与奖励函数。
-- `cs336_alignment.llm_backend.build_llm()` 已提供平台和模型名映射。当前 `math_baseline.py` 仍直接构造 `LLM` 并使用调试模型名，迁移时需要实际接好入口。
-- macOS 的多进程入口保持 `if __name__ == "__main__":` 保护。H20 的模型加载、推理和训练兼容性在启动后分别验证。
+## 个人检查清单
 
-本机推理调试入口为
+- [x] SFT 基础 #2–7 完成，训练 CLI、多 epoch 与 FP32/BF16 tiny 更新验证已具备。
+- [x] GRPO 基础 #10–15 完成，单批单次更新循环与 7 项训练回归已具备。
+- [x] 最新六文件离线回归 61 项通过，正式训练产物与测试证据已区分。
+- [ ] 用户自行完成 #22 同批复用，核对缓存、更新次数与梯度累积边界。
+- [ ] 通过指导完成 #1、8、9 的实验设计与结果分析学习，正式错误分析仍暂缓。
+- [ ] 结合已实现的 #12、16 和后续 #22，完成 #18、20、21、19 的机制、小例与条件结论学习。
 
-```sh
-~/.venv-vllm-metal/bin/python -m cs336_alignment.math_baseline
-```
-
----
-
-## 工作流程
-
-### 阶段 1：本机继续实现与验证
-
-先补完整 SFT loop、MATH 数据入口、配置、保存与恢复，以及训练中调用 `log_generations` 的位置。当前 tiny 模型测试已经在 CPU 上覆盖 FP32/BF16 的真实生成、两次反传之间的日志调用、梯度保留和 optimizer 更新。
-
-当前基础实现的验证命令为
-
-```sh
-env -u UPDATE_SNAPSHOTS HF_HUB_OFFLINE=1 .venv/bin/python -m pytest \
-  tests/test_sft.py tests/test_logging.py tests/test_sft_optimizer_step.py -q
-```
-
-后续按对应阶段补 GRPO 的 6 个基础函数和训练 loop。可选支线的 5 个 adapter 与 7 项测试单独推进。
-
-### 阶段 2：H20 环境与小验证
-
-1. 启动 H20，记录设备、显存、软件版本、代码提交和可持久化目录。
-2. 准备讲义所需 MATH `train.jsonl`、`validation.jsonl`、`sft.jsonl` 与 Qwen2.5-Math-1.5B Base，确认字段和模型版本。
-3. 跑小批量生成、奖励计算与评分，再跑少量 SFT 步骤，检查 loss/梯度有限且参数确实更新。
-4. 验证 checkpoint 保存、重载及训练继续，确认实际显存峰值与用时后再调 batch size。
-
-### 阶段 3：单张 H20 主线实验
-
-1. **正式 MATH baseline**。替换 GSM8K 10 条调试入口，跑完 5000 条验证集，保存原始响应与奖励，统计三桶、分析两类错误各至少 10 例，并报告准确率。
-2. **SFT**。跑数据规模比较与正确答案过滤实验，记录每组配置、验证曲线、过滤后数据量和 checkpoint。
-3. **Expert Iteration**。先完成一轮采样、过滤、SFT 和评估的衔接，再按题目要求做 5 轮和配置比较。
-4. **GRPO、消融与 off-policy**。完成主循环短运行后，依次推进学习率、baseline、长度归一化、标准差归一化、off-policy sweep、去 clip 与 prompt 消融。
-5. **Leaderboard 实验**。在 H20 上记录算法表现、硬件和实际 wall-clock。正式讲义的双 H100 / 4 小时约束按 Part 7 单独核对并安排验证。
-
-单张卡先按阶段顺序复用生成、训练和评估资源。可在阶段边界保存 checkpoint，释放当前阶段的 GPU 资源，再加载需要的模型继续下一阶段。EI/GRPO 生成时使用当前策略的权重，保存优化器状态和步数以支持训练继续。脚本先跑通，再依据实际显存和耗时调整 batch。
-
-日志可先写本地 JSONL 再生成曲线，wandb 按需接入。实验持续保存配置、代码版本、采样设置、loss、reward、响应长度、熵、梯度范数、显存峰值与耗时。checkpoint 写入已确认的持久化目录，保留模型、优化器及适用的 scheduler/RNG 状态，并在优化器更新边界验证恢复。远程运行可使用 `tmux` 保持会话。
-
-### 阶段 4：本机收尾
-
-- 汇总日志、验证结果、配置及 checkpoint metadata，确认曲线对应准确的代码和模型版本。
-- 按主讲义逐题完成 `writeup.pdf`，报告实验对比与硬件、时间预算。
-- 整理代码及所需产物，保存原始结果以便复核和恢复。
-
----
-
-## 风险与备选
-
-- GPU 依赖兼容性在启动后通过实际导入、短生成及反传确认，记录最终版本组合。
-- 出现 OOM 时，先根据显存峰值减小生成或训练 microbatch，再评估梯度累积、gradient checkpointing 等配置。
-- 同卡阶段切换时核对策略权重版本与资源释放，保存可恢复的训练状态。
-- 8B 补充训练与 70B 评审单独评估资源需求，分别记录可运行条件与待安排环节。
-
----
-
-## 检查清单
-
-已有本机验证
-
-- [x] SFT 六个基础题实现并接入测试。
-- [x] SFT 与 logging 定向测试 24 项通过。
-- [x] tiny HF causal LM 的 CPU FP32/BF16 生成、反传、日志及 optimizer 更新衔接通过。
-- [x] 单个有效 batch 的优化器步实现，新增 4 项 CPU FP32 整批对照测试通过。
-
-H20 启动后及主线下一步
-
-- [ ] 核对单张 H20 的实际显存、驱动、CUDA、依赖和持久化存储。
-- [ ] 正式 MATH 数据与模型已准备，baseline 入口完成替换并验证。
-- [ ] 小批量生成、评分及少量 SFT 步骤通过，记录显存峰值与耗时。
-- [ ] checkpoint 保存、重载、评估及训练恢复通过。
-- [ ] MATH 全量 baseline 的三桶、错误案例和准确率已交付。
-- [ ] SFT 数据规模与过滤实验完成，随后推进 EI、GRPO 及消融。
-- [ ] 为 Leaderboard 的正式双 H100 时间预算验证另行安排资源。
-
-可选支线
-
-- [ ] 本机完成 5 个可选 adapter 及对应 7 项测试。
-- [ ] 单张 H20 上核对 8B SFT 与 DPO 的实际可运行配置。
-- [ ] 单独安排 70B 评审所需资源或确认可用方案，再补齐相关评估。
+#17、23–25、#26 及 Safety/RLHF 不计入当前个人必做清单，后续可重新选择。正式课程口径的未交付项仍如上表保留，个人自学达成与课程完整交付分别记录。
