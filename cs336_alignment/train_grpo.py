@@ -1,12 +1,14 @@
 """GRPO 基础训练入口，用同一个 HF 模型衔接生成与训练。
 
-当前每批新生成的回答只完成一次参数更新，没有同批回答的多次更新循环。
-单次更新下的概率比裁剪、梯度路径和模型模式详见
+每批回答按 train_batch_size 切片，每个 epoch 顺序遍历全部回答。
+默认整批训练一次，可通过 epochs_per_rollout_batch 复用。
+首次更新时的概率比、梯度路径和模型模式详见
 notes/grpo-clip-single-update.md。
 """
 
 from __future__ import annotations
 
+import math
 import random
 from typing import Callable, Literal
 
@@ -85,6 +87,8 @@ def grpo_optimizer_step(
     loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"] = "grpo_clip",
     cliprange: float = 0.2,
     max_grad_norm: float = 1.0,
+    reference_log_probs: Tensor | None = None,
+    kl_beta: float = 0.0,
 ) -> dict[str, float]:
     """将整批 N 条回答拆成微批，完成一次梯度累积、裁剪和参数更新。
 
@@ -94,6 +98,9 @@ def grpo_optimizer_step(
     raw_rewards 和 advantages 均为 (N, 1)，每条回答的权重沿 token 轴广播。
     grpo_clip 使用固定的 old_log_probs，其形状为 (N, L)，需要在更新前
     缓存并保持无梯度，与当前整批标签逐位置对齐。其余损失模式可传 None。
+    reference_log_probs 是独立固定参考策略对相同标签的评分，形状为 (N, L)，
+    不承担 old 策略的概率比分母角色。kl_beta 默认 0，完全禁用参考评分项。
+    正值时所有 loss 分支均加入 KL，参考分数须已位于输入所在设备。
 
     N 为正且能够被 microbatch_size 整除，累积步数 K=N/microbatch_size。
     各输入仅按第 0 维切微批，保留整批编码时的 token 轴和 padding 对齐。
@@ -111,11 +118,21 @@ def grpo_optimizer_step(
 
     返回 loss 为本批次各个已按 K 缩放的微批损失之和，
     grad_norm_before_clip 为裁剪前的全局梯度范数。
+    启用 KL 时 loss 包含加权 KL，另返回未乘 kl_beta 的 kl_loss，
+    由各微批已除以 K 的 KL 分量相加得到。
     可选 clip_fraction 按有效 response token 统计实际裁剪比例，
     分母使用整批 response_mask 的有效 token 数。
     """
+    if not math.isfinite(kl_beta) or kl_beta < 0:
+        raise ValueError("kl_beta 必须为非负有限数")
+    if kl_beta > 0:
+        if not isinstance(reference_log_probs, Tensor) or reference_log_probs.shape != input_ids.shape:
+            raise ValueError("正 kl_beta 需要与 input_ids 完整对齐的 reference_log_probs")
+        if reference_log_probs.device != input_ids.device:
+            raise ValueError("reference_log_probs 必须与 input_ids 位于同一设备")
     assert input_ids.shape[0] > 0 and microbatch_size > 0 and input_ids.shape[0]%microbatch_size  == 0
     losses = []
+    kl_losses = []
     K: int=input_ids.shape[0]//microbatch_size
     # 旧分数在 eval 下缓存；这里仍切回 train，若启用 Dropout，评分可能发生变化。
     model.train()
@@ -130,6 +147,11 @@ def grpo_optimizer_step(
         micro_old_log_probs = (
             old_log_probs[i:i + microbatch_size, :]
             if old_log_probs is not None
+            else None
+        )
+        micro_reference_log_probs = (
+            reference_log_probs[i:i + microbatch_size, :]
+            if kl_beta > 0 and reference_log_probs is not None
             else None
         )
         # 当前策略的 log-prob 需要保留计算图，供微批 loss 反向传播。
@@ -153,13 +175,21 @@ def grpo_optimizer_step(
             advantages=advantages[i: i + microbatch_size, :],
             old_log_probs=micro_old_log_probs,
             cliprange=cliprange,
+            reference_log_probs=micro_reference_log_probs,
+            kl_beta=kl_beta,
         )
         losses.append(batched_masked_loss)
+        if kl_beta > 0:
+            kl_losses.append(matadata["kl_loss"])
     grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm, norm_type=2.0)
     optimizer.step()
-    return {
-            "loss": sum(loss.item() for loss in losses), "grad_norm_before_clip": grad_norm_before_clip.item()
-        }
+    result = {
+        "loss": sum(loss.item() for loss in losses),
+        "grad_norm_before_clip": grad_norm_before_clip.item(),
+    }
+    if kl_beta > 0:
+        result["kl_loss"] = sum(loss.item() for loss in kl_losses)
+    return result
 
 
 
@@ -178,6 +208,10 @@ def grpo_train_loop(
     n_prompts_per_step: int,
     group_size: int,
     microbatch_size: int,
+    epochs_per_rollout_batch: int = 1,
+    train_batch_size: int | None = None,
+    reference_model: PreTrainedModel | None = None,
+    kl_beta: float = 0.0,
     loss_type: Literal["no_baseline", "reinforce_with_baseline", "grpo_clip"] = "grpo_clip",
     advantage_eps: float = 1e-6,
     normalize_by_std: bool = True,
@@ -189,35 +223,77 @@ def grpo_train_loop(
 ) -> list[dict[str, float]]:
     """抽题、生成、计算组内优势并更新模型，返回按更新顺序排列的 history。
 
-    num_steps 表示优化器更新次数。本地初版每轮抽取 P=n_prompts_per_step
-    道题，用 generate_rollouts 得到 N=P*group_size 条回答，然后执行一次
-    grpo_optimizer_step。下一轮使用更新后的同一个模型生成新回答。
-    后续可以在这一流程上扩展同一批 rollout 的多次复用。
+    每批抽取 P=n_prompts_per_step 道题，生成 N=P*group_size 条回答。
+    在完整回答组上计算 reward 和 advantage，将权重整理成 (N, 1)，
+    再一次性编码整批，得到对齐的 (N, L) 张量。seed 用于题目抽样和生成。
 
-    当前批次的旧分数和当前分数在参数更新前计算；若前向行为一致，
-    ratio 接近 1，概率比裁剪通常不改变目标，但 ratio 的计算图仍用于反传。
-    这不代表 clip_grad_norm_ 无效，它裁剪的是另一对象：累积后的参数梯度。
-    详细公式、反传示例与复用扩展见 notes/grpo-clip-single-update.md。
+    epochs_per_rollout_batch 控制同一批回答遍历几轮，默认 1。
+    每轮从第 0 行顺序切 train_batch_size 条回答，默认 train_batch_size=N。
+    每个切片调用一次 grpo_optimizer_step，内部按 microbatch_size 累积反传后更新。
+    N 需能被 train_batch_size 整除，train_batch_size 需能被 microbatch_size 整除。
+    完整一轮产生 N/train_batch_size 次更新，每个微批均用当前参数重新前向。
+    num_steps 是总更新次数，最后一批或最后一轮按剩余额度提前结束。
+    下一批回答由更新后的模型重新生成。
 
-    每轮先对完整回答组调用 compute_group_normalized_rewards。
-    组内 reward/advantage 全部计算完成后，将一维权重整理成 (N, 1)，
-    再用 tokenize_prompt_and_output 一次编码整批，得到对齐的 (N, L) 张量。
-    在参数更新前，以临时 eval 和 torch.no_grad() 缓存旧策略的 log-prob，
-    恢复模型模式后，将同一批编码、权重和旧分数交给优化器步。
+    同批复用期间，回答、reward 和 advantage 保持固定。no_baseline 与
+    reinforce_with_baseline 在单次更新和同批复用时使用同一个公式，分别用
+    reward 或 advantage 加权当前 log-prob，策略项均不使用 current/old 概率比。
+    当前策略变化后，这些回答仍来自生成时的策略，属于 off-policy 数据，
+    这两个损失分支直接使用这些回答，未对采样分布的变化做概率比修正。
 
-    seed 用于题目抽样与生成的可复现设置。每轮 N 需满足优化器步的微批条件。
-    history 每项记录该次更新的 loss、grad_norm_before_clip、原始奖励均值等
-    Python float 指标，可附带按有效回答 token 统计的 clip_fraction。
+    grpo_clip 在首次更新前用 eval 和 torch.no_grad() 缓存该批的 old_log_probs，
+    整个复用期间保持旧分数固定。若新旧评分的前向行为一致，
+    首次更新前 ratio 接近 1，仍通过当前分数反传。参数更新后，后续更新的
+    ratio 可能偏离 1，裁剪可能开始影响部分 token 的损失。每次优化器步还会
+    对累积的参数梯度做范数裁剪。公式见 notes/grpo-clip-single-update.md。
+
+    kl_beta 默认为 0，完全跳过 reference_model。正值时调用方须提供固定、
+    参数独立的参考模型，并保证它与当前策略使用相同 token-ID 空间。
+    reference 用于 KL，old 用于本批 rollout 的概率比，两种角色分别缓存。
+    每批在 reference 自身设备上以临时 eval/no_grad 完整评分一次，随后将
+    参考分数移到训练设备，同批所有切片和 epoch 复用，参考模型本身不迁移。
+    这里沿用普通 HF 模型所有参数位于单一设备的使用方式。
+
+    history 每项独立记录一个训练切片更新的 loss、grad_norm_before_clip，
+    原始奖励统计沿用该切片所属完整 rollout 批次的统计。
+    启用 KL 时 loss 是总损失，并额外记录未乘 kl_beta 的 kl_loss。
     """
     assert len(prompt_strs) == len(ground_truths)
-    assert n_prompts_per_step * group_size % microbatch_size == 0
+    rollout_batch_size = n_prompts_per_step * group_size
+    if type(rollout_batch_size) is not int or rollout_batch_size <= 0:
+        raise ValueError("rollout_batch_size 必须为正整数")
+    if train_batch_size is None:
+        train_batch_size = rollout_batch_size
+    for name, value in (
+        ("epochs_per_rollout_batch", epochs_per_rollout_batch),
+        ("microbatch_size", microbatch_size),
+        ("train_batch_size", train_batch_size),
+    ):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} 必须为正整数")
+    if rollout_batch_size % train_batch_size != 0:
+        raise ValueError("rollout_batch_size 必须能被 train_batch_size 整除")
+    if train_batch_size % microbatch_size != 0:
+        raise ValueError("train_batch_size 必须能被 microbatch_size 整除")
+    if not math.isfinite(kl_beta) or kl_beta < 0:
+        raise ValueError("kl_beta 必须为非负有限数")
+    if kl_beta > 0:
+        if reference_model is None:
+            raise ValueError("正 kl_beta 需要独立的 reference_model")
+        if reference_model is model:
+            raise ValueError("reference_model 必须与当前策略独立，不能使用同一个模型")
+        policy_parameter_ids = {id(parameter) for parameter in model.parameters()}
+        if any(id(parameter) in policy_parameter_ids for parameter in reference_model.parameters()):
+            raise ValueError("reference_model 不能与当前策略共享 Parameter")
     assert group_size >= 2
     rng = random.Random(seed)
     torch.manual_seed(seed)
     device = next(model.parameters()).device
     history = []
 
-    for step in range(num_steps):
+    completed_updates = 0
+    while completed_updates < num_steps:
+        # 还是抽样
         indices:list[int] = rng.sample(range(len(prompt_strs)), n_prompts_per_step)
         ps = [prompt_strs[i] for i in indices]
         ts = [ground_truths[i] for i in indices]
@@ -225,7 +301,7 @@ def grpo_train_loop(
             model=model, tokenizer=tokenizer,prompt_strs=ps,ground_truths=ts,
             group_size=group_size,max_new_tokens=max_new_tokens, temperature=temperature
         )
-
+        # 计算出 reward 和 advantage
         advantages_tensor, raw_rewards_tensor, metadata =  compute_group_normalized_rewards(
             reward_fn=reward_fn,
             rollout_responses=rollout_responses,
@@ -257,23 +333,50 @@ def grpo_train_loop(
                     labels = labels
                 )['log_probs'] # (N,L), 没有梯度
 
-        # 本轮只更新一次；下一轮会重新生成回答，并重新缓存对应的旧分数。
-        _step_res = grpo_optimizer_step(
-            model=model,
-            optimizer=optimizer,
-            input_ids=input_ids,
-            labels=labels,
-            response_mask=response_mask,
-            raw_rewards=raw_rewards_tensor,
-            advantages=advantages_tensor,
-            old_log_probs=old_log_probs,
-            microbatch_size=microbatch_size,
-            loss_type=loss_type,
-            cliprange=cliprange,
-            max_grad_norm=max_grad_norm
-        )
-        loss = _step_res["loss"]
-        grad_norm_before_clip = _step_res["grad_norm_before_clip"]
-        metadata.update(_step_res)
-        history.append(metadata)
+        # reference 对同一批已经生成的 labels 评分一次，跨训练切片与 epoch 复用。
+        # old 缓存生成策略的概率比分母，reference 提供固定 KL 参照，两者角色不同。
+        reference_log_probs = None
+        if kl_beta > 0 and reference_model is not None:
+            reference_device = next(reference_model.parameters()).device
+            with _evaluation_context(reference_model):
+                reference_log_probs = get_response_log_probs(
+                    model=reference_model,
+                    input_ids=input_ids.to(reference_device),
+                    labels=labels.to(reference_device),
+                )["log_probs"].to(device)
+
+        # 每个 epoch 都从第 0 行开始切 train batch，复用同一批已生成的回答。
+        # 奖励、优势和已经缓存的旧分数、参考分数沿用本批的值，每步用当前参数重新评分。
+        # 策略一旦改变，继续用这批旧回答更新就属于 off-policy 训练。
+        for _ in range(epochs_per_rollout_batch):
+            if completed_updates >= num_steps:
+                break
+            for start in range(0, input_ids.shape[0], train_batch_size):
+                if completed_updates >= num_steps:  # 总步数用完就停，即使当前 epoch 还没走完。
+                    break
+                end = start + train_batch_size
+                rows = slice(start, end)
+                _step_res = grpo_optimizer_step(
+                    model=model,
+                    optimizer=optimizer,
+                    input_ids=input_ids[rows],
+                    labels=labels[rows],
+                    response_mask=response_mask[rows],
+                    raw_rewards=raw_rewards_tensor[rows],
+                    advantages=advantages_tensor[rows],
+                    old_log_probs=old_log_probs[rows] if old_log_probs is not None else None,
+                    microbatch_size=microbatch_size,
+                    loss_type=loss_type,
+                    cliprange=cliprange,
+                    max_grad_norm=max_grad_norm,
+                    reference_log_probs=(
+                        reference_log_probs[rows] if reference_log_probs is not None else None
+                    ),
+                    kl_beta=kl_beta,
+                )
+                # 分别留出中间值，方便回看和断点检查。
+                loss = _step_res["loss"]
+                grad_norm_before_clip = _step_res["grad_norm_before_clip"]
+                history.append({**metadata, **_step_res})
+                completed_updates += 1
     return history

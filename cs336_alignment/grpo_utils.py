@@ -102,8 +102,9 @@ def compute_grpo_clip_loss(
     这里逐 token 做 ratio/clipping，与先对 log-prob 差求和、
     形成整序列概率比后再 clip，对应不同的目标。
 
-    当前基础训练循环每批回答只更新一次。新旧评分的前向行为一致时，
-    更新前 ratio 接近 1，clamp 虽执行但通常不改变目标。
+    同批回答的首次更新前，若新旧评分的前向行为一致，ratio 接近 1，
+    clamp 通常不改变目标。复用该批时，旧分数保持固定，当前分数随参数
+    更新重新计算，后续的 ratio 可能偏离 1 并触发裁剪。
     仍不能将 ratio 直接改为常数 1：exp(new-old) 对 new 的导数为 ratio，
     即使其数值为 1 仍能传递梯度；常数 1 则切断这条策略梯度路径。
     old 必须固定且无梯度，避免 exp(new-new) 的两条求导路径相互抵消。
@@ -186,6 +187,9 @@ def grpo_microbatch_train_step(
     advantages: torch.Tensor | None = None,
     old_log_probs: torch.Tensor | None = None,
     cliprange: float | None = None,
+    *,
+    reference_log_probs: torch.Tensor | None = None,
+    kl_beta: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """聚合逐 token 贡献，并对当前微批的标量损失执行反向传播。
 
@@ -195,10 +199,18 @@ def grpo_microbatch_train_step(
     即先得到每条回答的平均 token 损失，再对 B 条回答取平均并除以 K。
     外层使用等大微批时，除以 K 后累积对应这些微批的平均损失梯度。
 
+    kl_beta > 0 时，在任一策略损失上加 KL 正则。reference_log_probs 是同一批
+    token 的固定参考分数，形状与 policy_log_probs 一致。对采样 token 取
+    d=log p_ref-log p_current，KL 估计为 exp(d)-d-1，沿相同的 mask 和 K 归约。
+    metadata["kl_loss"] 是未乘 kl_beta 的微批贡献，用于外层汇总日志。
+
     backward() 沿计算图将梯度累加到模型参数。输入为叶子张量或已调用
     retain_grad() 时，也可在上游 policy_log_probs.grad 查看梯度。
     外层训练循环负责 optimizer 更新。返回的损失已 detach，用于日志记录。
     """
+
+    if not math.isfinite(kl_beta) or kl_beta < 0:
+        raise ValueError("kl_beta 必须为有限非负数")
 
     # 策略梯度权重来自完整回答的评分，底层仍返回 (B, L) 的 token 贡献。
     loss,metadata = compute_policy_gradient_loss(
@@ -214,5 +226,20 @@ def grpo_microbatch_train_step(
     # 对 batch 取 mean 才得到标量。例中 mean=4.5，K=2 后反传 loss=2.25。
     # 除以 K 只缩放数值，batch 维的归约由 mean 完成。
     batched_masked_loss = masked_loss.mean() / gradient_accumulation_steps
+    if kl_beta > 0:
+        if reference_log_probs is None or reference_log_probs.shape != policy_log_probs.shape:
+            raise ValueError("启用 KL 需要与 policy_log_probs 形状一致的 reference_log_probs")
+        # KL 标记，DeepSeekMath 式 (4) 的 k3 估计，d=log(ref/current)，k3=exp(d)-1-d。
+        # 在旧 rollout 的 token 上直接加入惩罚，不乘 current/old 概率比。
+        # 相同前缀下，对当前策略分布取期望才还原标准 KL(current || reference)。
+        # 详见 notes/grpo-clip-single-update.md §3 的 KL 说明。
+        log_ratio = reference_log_probs.detach() - policy_log_probs
+        # exp 前屏蔽 prompt/padding，避免无效位置溢出后污染归约。
+        log_ratio = log_ratio.masked_fill(~response_mask.bool(), 0.0)
+        token_kl = torch.expm1(log_ratio) - log_ratio
+        kl_loss = masked_mean(token_kl, mask=response_mask, dim=-1).mean() / gradient_accumulation_steps
+        batched_masked_loss = batched_masked_loss + kl_beta * kl_loss
+        metadata["kl_loss"] = kl_loss.detach()
+
     batched_masked_loss.backward()
     return batched_masked_loss.detach(), metadata

@@ -1,4 +1,8 @@
+import math
+
 import torch
+
+from cs336_alignment import grpo_utils
 
 from .adapters import (
     run_compute_group_normalized_rewards as compute_group_normalized_rewards,
@@ -248,3 +252,26 @@ def test_grpo_microbatch_train_step_grpo_clip_10_steps(
         "policy_log_probs_grad": torch.stack(grad_list),
     }
     numpy_snapshot.assert_match(output)
+
+
+def test_grpo_microbatch_kl_value_and_gradient_with_response_mask():
+    log4 = math.log(4)
+    policy = torch.tensor([[-log4, -log4, -1000], [-log4, -1000, -1000]], dtype=torch.float64, requires_grad=True)
+    reference = torch.tensor([[-math.log(2), -log4, 0], [-math.log(8), 0, 0]], dtype=torch.float64, requires_grad=True)
+    mask = torch.tensor([[True, True, False], [True, False, False]])
+    beta = 0.4
+    loss, metadata = grpo_utils.grpo_microbatch_train_step(
+        policy_log_probs=policy, response_mask=mask, gradient_accumulation_steps=2,
+        loss_type="no_baseline", raw_rewards=torch.ones(2, 1),
+        reference_log_probs=reference, kl_beta=beta,
+    )
+
+    # 有效 token 的 ref/current 比值为 [2, 1] 和 [0.5]。两条回答等权，K=2。
+    expected_kl = ((1 - math.log(2)) / 2 + (math.log(2) - 0.5)) / 4
+    assert not metadata["kl_loss"].requires_grad
+    torch.testing.assert_close(metadata["kl_loss"], policy.new_tensor(expected_kl))
+    torch.testing.assert_close(loss, policy.new_tensor(log4 / 2 + beta * expected_kl))
+    # d(KL)/d(log p_current) = 1 - p_ref/p_current。
+    expected_grad = policy.new_tensor([[(-1 - beta) / 8, -1 / 8, 0], [(-1 + beta / 2) / 4, 0, 0]])
+    torch.testing.assert_close(policy.grad, expected_grad)
+    assert reference.grad is None

@@ -1,12 +1,12 @@
-# 当前 GRPO 的单次更新、概率比与梯度
+# GRPO 的更新、概率比和 KL 正则
 
-当前实现每轮用最新模型生成一批回答，再用这批回答完成一次优化器更新。`grpo_optimizer_step` 内部多次 `backward()` 累积梯度，参数在最后的 `optimizer.step()` 改变一次。
+默认配置每轮用最新模型生成一批回答，再用整批回答完成一次优化器更新。`grpo_optimizer_step` 内部多次 `backward()` 累积梯度，参数在最后的 `optimizer.step()` 改变一次。配置训练批大小和每批 epoch 数后，可以对同一批 rollout 多次更新，见第 8 节。
 
 源码引用对应当前工作区，文中的数值例子已用 CPU 核对。
 
 ## 1. 一轮训练到底更新几次
 
-沿用同一个例子，每轮抽取 2 道题，每题生成 4 条回答，共 8 条回答。每个微批处理 2 条回答，需要 4 次微批反传。
+沿用同一个例子，每轮抽取 2 道题，每题生成 4 条回答，共 8 条回答。按默认配置用整批回答做一次更新，每个微批处理 2 条回答，需要 4 次微批反传。
 
 | 符号 | 含义 | 本例 |
 |---|---|---|
@@ -18,9 +18,9 @@
 
 同一道题的 4 条回答连续排列。完整回答先得到 reward，组内比较后得到 advantage，再切成微批。即使一个回答组跨越多个微批，优势也已经使用完整组的信息算好。当前 [compute_group_normalized_rewards:7](../cs336_alignment/grpo_utils.py#L7) 根据完整回答的评分构造数值张量，随后将这些数值传给训练前向和 `backward()`。
 
-这里的优势 \(A\) 在本批更新中固定，不沿采样、reward 或组内比较的过程对模型参数 \(\theta\) 求导。生成策略会影响采到什么回答，从而影响算出的 \(A\)，但本次反传只通过当前回答的 log-prob 回到参数。以后若复用同一批回答，\(A\) 也保持固定，下一轮重新生成回答后才可能重新算出不同的优势。
+这里的优势 \(A\) 在本批更新中固定，不沿采样、reward 或组内比较的过程对模型参数 \(\theta\) 求导。生成策略会影响采到什么回答，从而影响算出的 \(A\)，本次反传只通过当前回答的 log-prob 回到参数。复用同一批回答时，\(A\) 也保持固定。下一轮重新生成回答后才会重新计算优势。
 
-当前两轮执行过程如下。\(D_0,D_1\) 分别表示两轮生成并编码的回答批次，`old0`、`old1` 是各批更新前缓存的旧 log-prob。
+默认配置下，两轮执行过程如下。\(D_0,D_1\) 分别表示两轮生成并编码的回答批次，`old0`、`old1` 是各批更新前缓存的旧 log-prob。
 
 ```text
 第 0 轮，参数 θ0
@@ -40,9 +40,9 @@
       → 一次梯度范数裁剪 → 一次 optimizer.step → θ2
 ```
 
-第一个微批反传后，第二个微批使用的仍是 θ0。`backward()` 把导数累加到参数的 `.grad`，不会执行参数更新。最后一次反传结束，才把完整批次的梯度交给优化器。当前 `num_steps` 因而表示优化器更新次数，同时也是新 rollout 批次的生成轮数。
+第一个微批反传后，第二个微批使用的仍是 θ0。`backward()` 把导数累加到参数的 `.grad`。最后一次反传结束，才把完整训练批的梯度交给优化器。`num_steps` 表示优化器更新总次数。在默认配置下，这也等于生成的 rollout 批数。
 
-对应源码入口是 [grpo_train_loop:169](../cs336_alignment/train_grpo.py#L169)。[外层循环:220](../cs336_alignment/train_grpo.py#L220) 每轮生成新回答，[调用优化器步:261](../cs336_alignment/train_grpo.py#L261) 只有一次。
+对应源码入口是 [grpo_train_loop](../cs336_alignment/train_grpo.py#L199)。外层 `while` 每轮生成新回答，默认配置下每批只调用一次优化器步。
 
 优化器步的关键顺序可以压缩成下面几行，省略了切片和参数传递。
 
@@ -50,14 +50,14 @@
 # grpo_optimizer_step 的执行顺序
 model.train()
 optimizer.zero_grad(set_to_none=True)
-for each_microbatch in the_same_rollout_batch:
+for each_microbatch in train_batch:
     current_log_probs = get_response_log_probs(...)  # 保留计算图
     grpo_microbatch_train_step(...)                  # 内部 backward，累积梯度
 grad_norm_before_clip = torch.nn.utils.clip_grad_norm_(...)
 optimizer.step()                                     # 整批只在这里更新一次
 ```
 
-这段是教学摘录，`each_microbatch` 省略了实际切片代码。完整实现见 [grpo_optimizer_step:74](../cs336_alignment/train_grpo.py#L74)，参数更新位于 [optimizer.step:159](../cs336_alignment/train_grpo.py#L159)。
+这段是教学摘录，`each_microbatch` 省略了实际切片代码。完整实现见 [grpo_optimizer_step](../cs336_alignment/train_grpo.py#L76)，参数更新位于 [optimizer.step](../cs336_alignment/train_grpo.py#L185)。
 
 ## 2. 完整回答评分，逐 token 形成损失
 
@@ -96,7 +96,7 @@ batched_masked_loss.backward()                             # 梯度累加到参�
 return batched_masked_loss.detach(), metadata              # detach 仅用于返回日志值
 ```
 
-见 [masked_mean:165](../cs336_alignment/grpo_utils.py#L165)、[微批训练步:180](../cs336_alignment/grpo_utils.py#L180) 和 [mean/K:216](../cs336_alignment/grpo_utils.py#L216)。优化器步将各微批返回的 scaled loss 相加，作为本次完整 batch 的日志 loss。
+见 [masked_mean](../cs336_alignment/grpo_utils.py#L166) 和 [微批训练步](../cs336_alignment/grpo_utils.py#L181)。优化器步将各微批返回的 scaled loss 相加，作为本次完整 batch 的日志 loss。
 
 ## 3. old、current 和 reference 各负责什么
 
@@ -105,8 +105,8 @@ old/current 描述策略在一次更新中的角色，并不要求必须存在�
 | 角色 | 本轮负责的工作 | 当前代码中的形态 |
 |---|---|---|
 | old policy | 为已采样回答提供固定的分母 log-prob | 更新前由同一个 `model` 评分，缓存无梯度 `(N, L)` 张量 |
-| current policy | 用当前参数重新评分，构建可反传的分子 | 同一个 `model` 在微批训练前向中产生带计算图的 log-prob |
-| reference policy | 为 KL 正则提供参照策略 | 本作业的这条训练路径省略 KL，没有这项评分 |
+| current policy | 用当前参数重新评分，供策略损失和可选 KL 反传 | 同一个 `model` 在微批训练前向中产生带计算图的 log-prob |
+| reference policy | 为 KL 正则提供固定参照 | `kl_beta > 0` 时，由独立 `reference_model` 对每批回答评分一次 |
 
 旧分数缓存之后，即使模型参数随后改变，缓存张量的数值也保持不变。这个固定分母已经足够支持当前的 ratio 计算，无须额外保存一份 old 模型。省略 reference KL 只去掉 KL 正则项，`grpo_clip` 仍然保留 current/old 的 ratio 和裁剪目标。
 
@@ -120,7 +120,77 @@ with _evaluation_context(model):
 # 随后交给 grpo_optimizer_step，重新前向获得带梯度的 current_log_probs
 ```
 
-旧分数缓存位置见 [train_grpo.py:254](../cs336_alignment/train_grpo.py#L254)。课程对 KL 的取舍见主讲义 [第 20 页脚注 2](../cs336_spring2025_assignment5_alignment.pdf#page=20)、[第 24 页式 33](../cs336_spring2025_assignment5_alignment.pdf#page=24) 和 [第 34 页 On KL divergence](../cs336_spring2025_assignment5_alignment.pdf#page=34)。原论文中的 GRPO 同时讨论了固定 old policy 与 reference KL，这能帮助区分角色，但本文的当前实现以本地代码和讲义省略 KL 的目标为准。[DeepSeekMath §4.1](https://arxiv.org/html/2402.03300v3#S4.SS1)
+### 3.1 标准 KL 怎样变成逐 token 的估计式
+
+固定一个前缀 \(s\)。\(p(a)=\pi_\theta(a\mid s)\) 是当前模型给候选 token \(a\) 的概率，\(q(a)=\pi_{\mathrm{ref}}(a\mid s)\) 是参考模型对同一个 token 的概率。标准 KL 对这个位置的整个词表求和。
+
+\[
+D_{\mathrm{KL}}(p\Vert q)
+=\sum_a p(a)\log\frac{p(a)}{q(a)}
+=\mathbb E_{a\sim p}\!\left[\log\frac{p(a)}{q(a)}\right].
+\]
+
+若手里只有一个采样 token，可以查它的两个 log-prob。令 \(d(a)=\log q(a)-\log p(a)\)，则 \(-d(a)\) 就是右边被平均的值。DeepSeekMath 在它上面加了一项 \(e^{d(a)}-1\)。当采样分布是 \(p\) 且覆盖 \(q\) 的支撑集时，这一项在平均后抵消。
+
+\[
+\begin{aligned}
+\mathbb E_{a\sim p}[e^{d(a)}-1]
+&=\sum_a p(a)\left(\frac{q(a)}{p(a)}-1\right)\\
+&=\sum_a q(a)-\sum_a p(a)=0.
+\end{aligned}
+\]
+
+这里仍然是按 \(p\) 采样。\(q(a)\) 是采到 \(a\) 之后查到的分数，\(\sum_a q(a)\) 则是展开期望并约掉每项的 \(p(a)\) 后，对整个词表各加一次。因此论文式 (4) 的逐 token 项 \(k_3(a)=e^{d(a)}-1-d(a)\) 在 \(p\) 下的期望是标准 KL。由于 \(e^d\ge 1+d\)，每个 token 的 \(k_3\) 都非负。若当前与参考给该 token 的概率相同，这一项为零。 [DeepSeekMath 式 (4)](https://arxiv.org/html/2402.03300v3#S4.SS1)
+
+### 3.2 同批复用时，为什么会和标准 KL 不同
+
+设 \(b=p_{\mathrm{old}}\) 是生成时实际使用的 token 采样分布。更新前模型采到了 A，更新后当前模型只给已经选中的 A 重新评分。这个分数随参数变，A 的采样来源仍是 \(b\)。所以代码在固定前缀上直接平均 \(k_3\) 时，对应 \(\mathbb E_{a\sim b}[k_3(a)]\)。只要 \(b\) 与当前 \(p\) 有差异，这个值一般会偏离 \(D_{\mathrm{KL}}(p\Vert q)\)。
+
+如果目标是用旧采样估计标准 KL，可以把每个 token 的权重从 \(b(a)\) 换回 \(p(a)\)。条件是 \(b\) 覆盖 \(p\) 的支撑集，且分母用的是实际采样概率。固定前缀下的换算是：
+
+\[
+\mathbb E_{a\sim b}\!\left[\frac{p(a)}{b(a)}\log\frac{p(a)}{q(a)}\right]
+=\sum_a p(a)\log\frac{p(a)}{q(a)}
+=D_{\mathrm{KL}}(p\Vert q).
+\]
+
+也可以对 \(k_3\) 本身乘 \(p(a)/b(a)\)，此时 \(\mathbb E_b[(p/b)k_3]=\mathbb E_p[k_3]\)。这两个带权估计式的期望相同，单个 token 上的值可以不同。实际采样时，以样本均值估计期望。这里讨论的是固定前缀的 token 分布，生成温度等设置可能让实际采样分布和对原始 logits 做 `log_softmax` 得到的评分分布不同。
+
+沿用两个 token 的例子。旧策略 \(b=(0.5,0.5)\)，当前策略 \(p=(0.2,0.8)\)，参考策略 \(q=(0.4,0.6)\)。
+
+| 期望中的贡献 | token A | token B | 合计 |
+| --- | ---: | ---: | ---: |
+| 旧样本乘 \(p/b\) 后的 \(\log(p/q)\) | \(0.5\times(0.2/0.5)\log(0.2/0.4)\) | \(0.5\times(0.8/0.5)\log(0.8/0.6)\) | \(0.09152\) |
+| 当前代码直接按旧样本平均 \(k_3\) | \(0.5\times(2-1-\log 2)\) | \(0.5\times(0.75-1-\log 0.75)\) | \(0.17227\) |
+
+这两个概率比各管一件事。\(q/p\) 用在逐 token 的 KL 估计式里，\(p/b\) 用于改变取期望的采样权重。当前代码的 `grpo_clip` 用 `current / old` 处理优势项，KL 项沿用旧样本的权重。**`history[i]["kl_loss"]` 在同批复用时记录的是第 \(i\) 次更新所用 rollout 样本上的正则值。** 当采样与评分分布一致、\(b=p\) 时，不加权的版本在期望上也等于标准 KL。
+
+### 3.3 DeepSeekMath 为什么这样写
+
+论文把 KL 惩罚直接加到目标中，组内 advantage 可以继续只按奖励计算。这是作者明确给出的设计理由。式 (3) 把 `current / old` 放在优势项里，式 (4) 为 KL 提供逐 token 的估计项。对照实现可以看到，只需缓存采样 token 的参考分数，就能在微批中加入这种惩罚。逐位置精确计算标准 KL 则需要两套完整词表分布。论文没有单独说明同批多次更新时省略 KL 采样修正的理由。 [DeepSeekMath 式 (3)–(4)](https://arxiv.org/html/2402.03300v3#S4.SS1)
+
+论文 §4.2 报告的 DeepSeekMath-RL 7B 实验每次探索采样后只做一次更新。就参数版本而言，形成这一步 loss 时模型还没有因为这批数据而更新。如果生成与评分的分布一致，就没有第 8 节中复用旧数据带来的策略滞后。当前实现把论文的正则项沿用到多个 epoch，因此需要区分这个正则值与当前分布的标准 KL。 [DeepSeekMath §4.2](https://arxiv.org/html/2402.03300v3#S4.SS2)
+
+### 3.4 代码怎样评分、归约和反传
+
+默认 `kl_beta=0` 对应讲义省略 KL 的目标。开启时，给 `grpo_train_loop` 传入使用相同 token ID 空间的独立、固定 `reference_model` 和正的 `kl_beta`。三个策略 loss 分支都支持。reference 在自身设备上临时 `eval()` 并用 `no_grad()` 对整批已经生成的标签评分一次，随后把 `(N, L)` 分数送到训练设备。同批每次更新用相同的行切出 reference 分数、标签和 mask，当前模型再为这一微批重新评分，得到对应的 `(B, L)` 张量。 [参考评分](../cs336_alignment/train_grpo.py#L338) · [微批调用](../cs336_alignment/train_grpo.py#L169)
+
+```python
+log_ratio = reference_log_probs.detach() - policy_log_probs  # d = log(q / p)
+log_ratio = log_ratio.masked_fill(~response_mask.bool(), 0.0)
+token_kl = torch.expm1(log_ratio) - log_ratio                # exp(d) - 1 - d
+kl_loss = masked_mean(token_kl, mask=response_mask, dim=-1).mean() / gradient_accumulation_steps
+batched_masked_loss = batched_masked_loss + kl_beta * kl_loss
+metadata["kl_loss"] = kl_loss.detach()
+```
+
+1. `masked_fill` 把 prompt 和 padding 位置的 \(d\) 置零，先屏蔽再取指数，避免无效位置得到 `inf` 后乘到零造成 `NaN`。`expm1(d)` 直接算 \(e^d-1\)，在 \(d\) 接近零时避免两个接近 1 的数相减。
+2. `masked_mean(..., dim=-1)` 用每条回答的有效 token 数作分母，`.mean()` 再对微批里的回答取平均。每个微批的回答数相同，除以累积次数 \(K\) 后，各微批的梯度合起来对应一个训练批的平均梯度。
+3. 策略 loss 与 `kl_beta * kl_loss` 相加后执行一次 `backward()`。参考分数已 `detach()`，因此梯度沿 current 的 log-prob 回传到模型参数。日志中的 `kl_loss` 是各微批未乘 `kl_beta` 的 KL 分量之和，`loss` 则记录总损失。这里对已固定的 token 评分求导，采样过程没有计算图。
+
+看一个具体位置。A 的当前概率为 \(0.2\)，参考概率为 \(0.4\)，因此 \(d=\log 2\)，\(k_3=2-1-\log 2\approx 0.30685\)。若微批只有一条回答且 A 是唯一有效 token，\(K=2\)、`kl_beta=0.1`，这项对反传 loss 的贡献是 \(0.1\times 0.30685/2\approx 0.01534\)。令 \(x=\log p(A)\)，则 \(\partial k_3/\partial x=(e^d-1)(-1)=1-e^d=-1\)，乘上 \(0.1/2\) 后，KL 对这个位置的 log-prob 梯度为 \(-0.05\)。 [KL 计算与反传](../cs336_alignment/grpo_utils.py#L229) · [解析梯度测试](../tests/test_grpo.py#L257)
+
+课程对 KL 的取舍见主讲义 [第 20 页脚注 2](../cs336_spring2025_assignment5_alignment.pdf#page=20)、[第 24 页式 33](../cs336_spring2025_assignment5_alignment.pdf#page=24) 和 [第 34 页 On KL divergence](../cs336_spring2025_assignment5_alignment.pdf#page=34)。
 
 ## 4. 先比较两条目标分支，再确定梯度
 
@@ -148,7 +218,7 @@ L=-J=-\min(u,c)=\max(-u,-c).
 
 ![PPO 裁剪损失 L，蓝线取两条负目标分支的最大值](assets/ppo-clipped-loss.png)
 
-loss 图中蓝线越低越好，取两条负目标分支中较大者。两图曲线和当前代码默认的 [cliprange](../cs336_alignment/train_grpo.py#L86) 均采用 \(\epsilon=0.2\)，对应区间 \([0.8,1.2]\)。图页脚提及的 \(\epsilon=10\) 对应下界 \(-9\)，属于另一设定，本笔记统一采用 \(0.2\)。
+loss 图中蓝线越低越好，取两条负目标分支中较大者。两图曲线和当前代码默认的 [cliprange](../cs336_alignment/train_grpo.py#L88) 均采用 \(\epsilon=0.2\)，对应区间 \([0.8,1.2]\)。图页脚提及的 \(\epsilon=10\) 对应下界 \(-9\)，属于另一设定，本笔记统一采用 \(0.2\)。
 
 先比较已经乘过 \(A\) 的两项，才能判断最终使用哪条分支。下表的导数针对单个 token 项，尚未乘 mask 和微批归约系数，\(A\) 与 \(p_{\mathrm{old}}\) 均固定。
 
@@ -200,7 +270,7 @@ metadata = {"clipped": c < u}               # 裁剪分支严格改变目标的�
 
 ## 5. ratio 为 1 时，沿计算图回到实际参数
 
-当前每批只更新一次。参数尚未改变时，old/current 对相同 token、前缀采用一致前向行为，ratio 就应当为 1 或接近 1。这时两条裁剪分支重合，loss 沿区间内的 ratio 分支求导。当前 old 使用 eval、current 使用 train，非零 Dropout 等行为差异可能破坏上述条件，具体模式在第 6 节说明。
+同批首次更新前，参数尚未改变。old/current 对相同 token、前缀采用一致前向行为时，ratio 就应当为 1 或接近 1。这时两条裁剪分支重合，loss 沿区间内的 ratio 分支求导。当前 old 使用 eval、current 使用 train，非零 Dropout 等行为差异可能破坏上述条件，具体模式在第 6 节说明。
 
 令 \(x\) 为当前 log-prob，\(x_{\mathrm{old}}=\log p_{\mathrm{old}}\) 为固定旧 log-prob。未触发有效裁剪时
 
@@ -256,9 +326,9 @@ SGD 用参数梯度更新参数。取学习率 \(0.1\)，同样只考虑这个 t
 
 当前 `_evaluation_context` 做了两件事，进入时调用 `eval()` 并开启 `no_grad()`，退出时逐个恢复所有子模块原有的 `training` 标志。即使原来部分子模块是 eval、其他模块是 train，也会恢复各自的状态。代码见 [_evaluation_context:40](../cs336_alignment/utils/log_utils.py#L40)。它适合不需要梯度的生成和 old 评分，不能包住 current 的训练前向，否则 current log-prob 没有用于策略更新的计算图。
 
-若希望 old/current 前向一致，可以让训练评分也使用 eval 行为并保留梯度，或在 train 行为下关闭 Dropout 等随机差异。当前 helper 内部会调用 [model.train:121](../cs336_alignment/train_grpo.py#L121)，采用前一种方案需要相应调整 helper，外部的一次 `model.eval()` 会被覆盖。
+若希望 old/current 前向一致，可以让训练评分也使用 eval 行为并保留梯度，或在 train 行为下关闭 Dropout 等随机差异。当前 helper 内部会调用 [model.train](../cs336_alignment/train_grpo.py#L138)，采用前一种方案需要相应调整 helper，外部的一次 `model.eval()` 会被覆盖。
 
-当前 [generate_rollouts:23](../cs336_alignment/train_grpo.py#L23) 在 `_evaluation_context` 中给 `model.generate` 传入 `do_sample=True`，生成仍会采样。eval 模式下也可以采样，模块模式、梯度记录、下一 token 的选择方法各自独立。
+当前 [generate_rollouts](../cs336_alignment/train_grpo.py#L25) 在 `_evaluation_context` 中给 `model.generate` 传入 `do_sample=True`，生成仍会采样。eval 模式下也可以采样，模块模式、梯度记录、下一 token 的选择方法各自独立。
 
 ## 7. 两种 clip 作用在不同位置
 
@@ -268,18 +338,17 @@ GRPO-Clip 的概率比裁剪改变逐 token 目标对 current log-prob 的导数
 
 这也解释了更新顺序。先把 4 个微批的梯度累加完，再对完整梯度裁剪，最后执行一次 step。若每个微批分别裁剪，得到的累积向量一般不等于先累积再统一裁剪的结果。若把 step 移入微批循环，则后面的微批会在已更新参数上评分，更新次数和优化过程都会改变。
 
-## 8. 将来复用同一批 rollout 时，哪些量固定
+## 8. 复用同一批 rollout 时，哪些量固定
 
-复用回答是后续可扩展的训练方式，当前尚未实现。扩展时，一批回答只生成一次，reward、advantage、old log-prob 也在这批回答开始更新前计算并固定。每次优化器更新都重新计算 current log-prob，清空上一更新的梯度，累积各微批反传，再做一次梯度范数裁剪和 step。
+一批回答只生成一次，reward、advantage 和 old log-prob 在开始更新前计算并固定。开启 KL 时，同一个固定的 reference 为该批回答评分，分数也只缓存一次。`train_batch_size` 决定一次更新用几条回答，`epochs_per_rollout_batch` 决定同一批回答要遍历几遍。沿用 8 条回答的例子，每次用 4 条回答、每个微批处理 2 条，两个 epoch 的执行顺序如下。
 
 ```text
 为一批 D0 缓存 old0 / reward0 / advantage0，整个复用期间固定
-    更新 1   zero_grad → current(θ0) → K 次 backward → clip → step → θ1
-    更新 2   zero_grad → current(θ1) → K 次 backward → clip → step → θ2
-    ……
+    epoch 1    0:4 → step 1 → θ1    4:8 → step 2 → θ2
+    epoch 2    0:4 → step 3 → θ3    4:8 → step 4 → θ4
 下一批 D1 才重新生成，并建立自己的 old1 / reward1 / advantage1
 ```
 
-第二次更新重新建立 current 的计算图，old0、reward0、advantage0 仍保持初始缓存值。每次更新在微批循环前清梯度，在循环结束后执行一次 step，保留第 1 节中的梯度累积边界。
+每次更新只取当前训练批对应的缓存行，清梯度并用当前参数重新评分。两个微批各反传一次，然后裁剪累积梯度，执行一次 `optimizer.step()`。第二步的 `4:8` 虽然首次参与训练，回答仍由 θ0 生成，此时评分已用 θ1。
 
-增加复用层后，需明确 `num_steps` 是 rollout 轮数还是优化器更新总数，并分别记录两种计数。当前两者一一对应，扩展后会分开。原论文算法中的固定 rollout 多次更新内层循环可作为后续对照。[DeepSeekMath §4.1 算法](https://arxiv.org/html/2402.03300v3#S4.SS1)
+`num_steps` 限制整个训练过程的优化器更新总数。若总预算只剩 3 次更新，这批回答会在第 3 步结束后停止。原论文算法中的固定 rollout 多次更新内层循环可作为对照。[DeepSeekMath §4.1 算法](https://arxiv.org/html/2402.03300v3#S4.SS1)
