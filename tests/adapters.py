@@ -11,6 +11,7 @@ from cs336_alignment.utils import tokenizer_utils
 from cs336_alignment.utils import compute_entropy 
 from cs336_alignment.utils import sft_utils
 from cs336_alignment import grpo_utils
+from cs336_alignment import dpo_utils
 
 
 def run_tokenize_prompt_and_output(
@@ -437,4 +438,12 @@ def run_compute_per_instance_dpo_loss(
     Returns:
         torch.Tensor with the DPO loss for this example.
     """
-    raise NotImplementedError
+    return dpo_utils.compute_per_instance_dpo_loss(
+        lm = lm,
+        lm_ref=lm_ref,
+        tokenizer=tokenizer,
+        beta=beta,
+        prompt=prompt,
+        response_chosen=response_chosen,
+        response_rejected=response_rejected,
+    )

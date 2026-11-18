@@ -15,7 +15,7 @@ def test_per_instance_dpo_loss():
     good_response = "the lazy dog."
     bad_response = "their crazy frog."
 
-    loss = compute_per_instance_dpo_loss(
+    dpo_inputs = dict(
         lm=model,
         lm_ref=model_ref,
         tokenizer=tokenizer,
@@ -25,4 +25,20 @@ def test_per_instance_dpo_loss():
         response_rejected=bad_response,
     )
 
+    loss = compute_per_instance_dpo_loss(**dpo_inputs)
     assert torch.isclose(loss, torch.tensor(0.5785), atol=1e-4)
+
+    policy_before = [parameter.detach().clone() for parameter in model.parameters()]
+    reference_before = [parameter.detach().clone() for parameter in model_ref.parameters()]
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+
+    with torch.no_grad():
+        loss_after_step = compute_per_instance_dpo_loss(**dpo_inputs)
+    assert any(not torch.equal(parameter, before) for parameter, before in zip(model.parameters(), policy_before))
+    for parameter, before in zip(model_ref.parameters(), reference_before):
+        assert parameter.grad is None
+        assert torch.equal(parameter, before)
+    assert loss_after_step < loss.detach(), f"DPO loss: {loss.item()} -> {loss_after_step.item()}"

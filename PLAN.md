@@ -2,21 +2,21 @@
 
 ## 目标与验收口径
 
-当前目标是通过本地代码实践和指导学习，理解 MATH 上的 SFT、Expert Iteration、GRPO 及其消融方法。当前没有可用训练卡，使用本机 CPU/MPS 做小模型验证。
+当前目标是理解数学推理训练中的 SFT、Expert Iteration、GRPO，以及指令与安全对齐中的偏好数据、DPO 和评估。当前没有可用训练卡，已用本机 CPU/MPS 验证训练机制。
 
-个人验收分为两条路线。代码部分由用户自己实现，以张量小例、定向测试和 tiny 模型的真实生成、反传、参数更新验证机制。实验部分通过讲义、可核实的已发表结论和案例指导，学习实验设计、曲线解读与结论边界，无需亲跑全部正式实验。
+当前安排的动手实现已完成。剩余的 DPO、Safety/RLHF 和主作业实验统一转入指导学习，用讲义、小例和公开实践理解机制、实验设计、曲线解读与结论边界。完整训练、评估和复现可按兴趣另行选择。
 
 正式课程的 26 题要求保留为对照。当前按整题交付口径，#2–7、#10–15、#22 共 **13 题完成**，另 **13 题尚未完整交付**。其中 #16 的基础训练循环已经实现，正式 MATH 训练奖励曲线和生成样例仍缺。个人自学按下文的机制理解、代码实践和分析能力验收，完整课程复现留作以后可选的目标。
 
 ## 当前进度与资源
 
-- 当前代码基线为 `5fca333`，分支为 `feature/my-work-2025`。
+- 当前是 `feature/my-work-2025` 分支。GRPO 同批复用与可选 KL 的提交为 `b5dcd3d`。
 - SFT 基础题 #2–7 已完成。已有 `sft_optimizer_step`、多 epoch 训练循环，以及支持模型/数据路径、batch、microbatch、学习率、设备和 FP32/BF16 的 CLI。训练返回 history，入口打印配置和逐步指标。
 - GRPO 基础题 #10–15 已完成。#16 已具备生成回答、整组评分与优势、编码、缓存 old log-prob、微批累积、梯度裁剪、参数更新和 history 的衔接。#22 已支持同批多 epoch 和分训练批更新。
-- 前次六文件离线回归 **61 项通过**，含本地 Qwen 的 FP32 评分、CPU FP32/BF16 tiny 模型训练、MPS 迁移和真实 HF generate。包含 #22 和可选 KL 的 GRPO 定向回归 **36 项通过**。正式 MATH 实验状态单独记录。
+- 最新七文件离线回归 **77 项通过**，涵盖 SFT、日志、GRPO 与 DPO。正式 MATH 实验状态单独记录。
 - 本地产物仍只有 GSM8K 的 10 条 baseline 调试样本。正式 MATH baseline、SFT/EI/GRPO 训练实验、checkpoint、实验曲线和 `writeup.pdf` 尚未交付。EI 尚无完整流程。正式 MATH 错误分析已暂缓。
 - `log_generations` 已实现并有训练衔接测试，普通 SFT/GRPO 循环尚未接入训练内采样日志、周期验证及保存恢复。是否补这些工程功能，按后续本地学习需要选择。
-- Safety/RLHF 补充支线的 5 个 adapter 尚未实现，对应 7 个可选用例，作为独立选学内容记录。
+- Safety/RLHF 补充题 `dpo_loss` 已完成并接入测试。tiny GPT-2 上验证了初始 loss、一次 `optimizer.step()` 后的 loss 下降，以及参考模型无梯度、参数固定。CPU/MPS 交叉放置也通过了单独验证。HH 数据处理、正式 DPO 训练和评估仍待学习，补充题的其余 4 个 adapter 未实现。[DPO 实现](cs336_alignment/dpo_utils.py#L12) · [DPO 测试](tests/test_dpo.py#L8)
 
 | 验证文件 | 最新通过数 | 主要覆盖 |
 |---|---|---|
@@ -24,8 +24,9 @@
 | `tests/test_logging.py` | 13 | 采样日志、空响应、模式恢复及 tiny FP32/BF16 训练衔接 |
 | `tests/test_sft_optimizer_step.py` | 4 | 微批累积与整批对照、裁剪及丢尾 |
 | `tests/test_train_sft.py` | 12 | 离线 CLI、多 epoch、FP32/BF16 更新及输入检查 |
-| `tests/test_grpo.py` | 14 | GRPO 基础损失、组内优势、mask 与微批训练步 |
-| `tests/test_train_grpo.py` | 7 | 三种 loss 的两轮更新、空回答保护、MPS 和 tiny HF generate |
+| `tests/test_grpo.py` | 15 | GRPO 基础损失、组内优势、mask、微批训练步和 KL 数值与梯度 |
+| `tests/test_train_grpo.py` | 21 | 同批多轮更新、参数校验、MPS、tiny HF generate 和可选 KL |
+| `tests/test_dpo.py` | 1 | 单条 DPO loss 数值、真实参数更新及固定参考模型 |
 
 ## 26 题索引与个人处理方式
 
@@ -43,7 +44,7 @@
 | 6 | `sft_microbatch_train_step` | 完成 | 保留微批归约、反传与梯度累积验证 |
 | 7 | `log_generations` | 完成 | 保留日志工具与 tiny 训练衔接验证，普通循环接入按需选做 |
 | 8 | `sft_experiment` | 训练 CLI 与 loop 已有，正式规模/过滤实验未做 | 指导学习数据规模、质量过滤和验证曲线，无需亲跑完整矩阵 |
-| 9 | `expert_iteration_experiment` | 尚无完整 EI 流程与实验 | 指导学习采样→判分过滤→SFT→重新采样的迭代机制与分析方法，本地流程实践后续可选 |
+| 9 | `expert_iteration_experiment` | 尚无完整 EI 流程与实验 | 指导学习采样、判分过滤、继续 SFT 和重新采样，以及每轮数据的变化 |
 
 ### #10–16　GRPO 基础与训练循环
 
@@ -55,22 +56,22 @@
 | 13 | `compute_policy_gradient_loss` | 完成 | 保留不同 loss 分支选择的实现与测试 |
 | 14 | `masked_mean` | 完成 | 保留 token 轴与 batch 轴归约的实现与测试 |
 | 15 | `grpo_microbatch_train_step` | 完成 | 保留每条回答 token 均值→batch 均值→除以 K 的反传验证 |
-| 16 | `grpo_train_loop` | 基础循环与 7 项训练回归已实现，正式 MATH reward 曲线和样例未交付 | 本地代码成果已具备，接下来指导分析训练 reward、验证表现与样例之间的关系 |
+| 16 | `grpo_train_loop` | 基础循环已实现，正式 MATH reward 曲线和样例未交付 | 指导分析训练 reward、验证表现与样例之间的关系 |
 
 ### #17–26　实验、消融、Off-policy 与 Leaderboard
 
 | # | Problem | 当前状态 | 个人处理方式 |
 |---|---|---|---|
-| 17 | `grpo_learning_rate` | 正式实验未做 | 后续待选，学习范围或实测范围按后续目标确定 |
+| 17 | `grpo_learning_rate` | 正式实验未做 | 指导学习学习率对照、训练稳定性和验证曲线 |
 | 18 | `grpo_baselines` | 损失分支已有，正式对比实验未做 | 指导学习 baseline 的作用、估计噪声与公平对比方法 |
 | 19 | `think_about_length_normalization` | 思考与分析尚待系统整理 | 指导推导长度权重，用短/长回答小例解释目标差异和条件 |
 | 20 | `grpo_length_normalization` | 正式归一化对比实验未做 | 指导比较不同归约的梯度尺度、长度权重及曲线读法 |
 | 21 | `grpo_group_standard_deviation` | 开关已有，正式消融实验未做 | 指导学习组内标准差归一化的机制与消融分析 |
 | 22 | `grpo_off_policy` | 已实现同批多 epoch、分训练批更新，通过本地测试 | 结合小模型验证复习 old 缓存和参数更新边界 |
-| 23 | `grpo_off_policy_sweep` | 正式 sweep 未做 | 后续待选，完成 #22 后再决定学习或实践范围 |
-| 24 | `grpo_off_policy_clip_ablation` | 正式消融未做 | 后续待选，学习重点是 Clip 与 No-Clip 的对照设计 |
-| 25 | `grpo_prompt_ablation` | 正式 prompt 消融未做 | 后续待选，学习重点是 prompt 与配套奖励设置的对照 |
-| 26 | `leaderboard` | 未做 | 正式讲义属于主作业，个人自学选做，当前保留挑战内容与评估协议的理解 |
+| 23 | `grpo_off_policy_sweep` | 正式 sweep 未做 | 指导比较 rollout 数据复用、更新次数、耗时和验证表现 |
+| 24 | `grpo_off_policy_clip_ablation` | 正式消融未做 | 指导学习 Clip 与 No-Clip 的公平对照，区分策略比裁剪和梯度范数裁剪 |
+| 25 | `grpo_prompt_ablation` | 正式 prompt 消融未做 | 指导学习 prompt、格式奖励和答案奖励怎样分别影响结论 |
+| 26 | `leaderboard` | 未做 | 指导学习固定训练预算下的评估协议和实验取舍，竞榜留作选做 |
 
 正式讲义的 #26 要求在 2 张 H100、4 小时训练约束下报告结果，是综合前面算法、在固定预算内提高 MATH 成绩的挑战。个人自学以理解与代码实践验收，竞榜、排名和官方硬件预算列为选做。以后如主动选择完整复现，再单独安排对应实验。
 
@@ -89,52 +90,53 @@
 
 验收时应能指出哪些量每个 rollout 刷新、哪些量每次更新刷新，并解释首次 ratio 接近 1 和后续可能偏离的条件。小例通过后再决定是否增加保存恢复、训练内采样日志或普通 GRPO CLI。
 
-## 指导学习实验的路线与验收
+## 后续指导学习路线
 
-用户指定的 #1、8、9、16、12、18、20、21、19 按下表衔接。#12 保持已实现、已学习状态，承担原理复习，不替换成其他题号。
+先从已经跑通的单条 DPO 更新往下学，再回到数学推理训练与消融。每个单元用一个小例讲机制，随后读公开实测并分析它能支持什么结论。#12 继续作为 Clip 原理复习项。
 
-| 学习单元 | 要回答的机制问题 | 可验收内容 |
+| 顺序 | 学习单元 | 机制、分析与验收 |
 |---|---|---|
-| #1 Baseline | 如何定义一次评估，格式与答案奖励分别衡量什么 | 能用小例统计三桶和准确率，说明采样设置、数据划分及错误案例的分析方法 |
-| #8 SFT | 数据规模与数据质量怎样分别设计对照 | 能设计 `{128,256,512,1024}` 与全量数据、正确性过滤的比较，指出训练步数/epoch、过滤后数据量与验证集等混杂因素 |
-| #9 EI | 为什么要重新采样、过滤和训练，每轮哪些数据与模型发生变化 | 能追踪至少两轮模型→回答→过滤数据→新模型，说明 rollout 数、SFT epoch、题目批量会影响什么，理解讲义五轮比较的目的 |
-| #16 + #12 训练与 Clip | 完整回答奖励如何变成 token 梯度，单次更新与同批复用有何区别 | 能结合已有代码画更新顺序，计算 A 正负下的 min/clamp 分支与参数更新，分析 reward 曲线和验证准确率不同步的可能原因 |
-| #18 Baseline 消融 | 减去组均值改变了什么，如何判断对比是否公平 | 能给出含固定奖励/优势的小例，区分单批梯度与跨采样的估计性质，列出对照需固定的条件 |
-| #20 + #19 长度归一化 | token 均值、回答均值和固定常数分别给哪些项加权 | 能推导并计算长短回答的权重，读长度/熵/奖励曲线时识别归约和梯度尺度的影响，不笼统断言某一归约完全消除长度偏差 |
-| #21 标准差消融 | 除以组内标准差怎样改变组间信号尺度 | 能比较同奖励差、不同组标准差的小例，说明零方差组与 eps 的作用，提出固定其他变量的比较方法 |
+| 1 | **DPO 剩余内容** · `look_at_hh`、`dpo_training` | 走一条 HH 记录，解释为什么要对齐同一 prompt、拆 `chosen/rejected`、过滤多轮和检查偏好噪声。把已有四分数和一步更新延伸到梯度累积、冻结参考模型、验证集与 checkpoint 选择。区分模型原始偏好分差、减去 reference 后的分差和生成偏好胜率。讨论 `beta`、数据来源与回答长度可能怎样影响结果。 |
+| 2 | **指令与安全对齐** · Safety/RLHF 补充 | 书中第 7 章的同类指令 SFT 以复习为主，补样本 packing、批迭代、评估 parser 和 `SFT → DPO → 评估` 的衔接。用 AlpacaEval、SimpleSafetyTests、MMLU、GSM8K 区分指令遵循、安全拒答与能力保留。讨论红队评估、过度拒答、裁判偏差和 alignment tax。 |
+| 3 | **评估、SFT 与 EI** · #1、#8–9 | 用小样本核对格式与答案奖励、分桶和可复现的评估配置。以讲义中的 `128/256/512/1024` 条和全量数据为例，设计规模和质量过滤的对照，区分样本量、训练步数和数据质量。追踪 EI 两轮的模型、采样、筛选和 SFT，解释 rollout 数及 SFT epoch 的作用。 |
+| 4 | **GRPO 训练与消融** · #12、#16–21 | 从已有代码追到奖励、优势、Clip、归一化和更新。用短长回答对照 token 均值、回答均值和常数归一化，再看 baseline、组标准差和学习率各改变什么。结合 reward、验证准确率、熵、长度和采样案例分析训练行为。 |
+| 5 | **Off-policy 与 Prompt** · #22–25 | 复习同批多个 epoch 中 old/current 的边界。比较按采样数、更新数和墙钟时间对齐的实验，分析复用与新旧策略偏离的权衡。Clip/No-Clip 对照中保留新旧概率比，只改变裁剪。做 prompt 对照时，把格式奖励的变化与答案正确率的变化分开看。 |
+| 6 | **固定预算与 2026 拓展** · #26、MaxRL、GSPO | 理解 leaderboard 的训练预算和验证协议。沿一组 rollout 对比 MaxRL 的优势归一化与 GSPO 的序列 ratio，说明它们分别改动训练链路的哪一步。对照 [2026 主讲义](https://github.com/stanford-cs336/assignment5-alignment/blob/main/cs336_spring2026_assignment5_alignment.pdf) 和原论文。 |
 
-每个单元都应落到机制解释、小例计算、曲线或案例分析以及带条件的结论。使用公开材料时记录模型、数据、训练预算和评估配置，再判断结论能否迁移到本项目。
+### 业界案例与证据
 
-分析中明确区分三种证据。数学结论由公式与假设推导，公开实测发现必须对应可核实的来源和实验条件，教学假设或示意曲线显式标注。当前没有正式 MATH accuracy 或训练曲线，不把讲义目标、论文数值或教学图当成本项目实测结果。正式 MATH 全量错误分析继续暂缓，不作为后续代码学习的前置。
+| 公开资料 | 后续具体看什么 |
+|---|---|
+| [Anthropic HH 数据](https://github.com/anthropics/hh-rlhf)及[论文](https://arxiv.org/abs/2204.05862)、[DPO 原论文](https://arxiv.org/abs/2305.18290) | 从同 prompt 的偏好对出发，对照显式 reward model 加 RL 与直接做 DPO 的数据、训练和评估流程。 |
+| [Meta Llama 3 技术报告](https://arxiv.org/html/2407.21783#S4)、[Hugging Face Zephyr 模型卡](https://huggingface.co/HuggingFaceH4/zephyr-7b-beta)、[SimpleSafetyTests](https://arxiv.org/abs/2311.08370) | 看 Llama 3 怎样刷新偏好数据、Zephyr 怎样用合成偏好及记录分差。比较指令遵循、安全表现及能力评估，核对能否把结果归因到某个训练阶段。 |
+| [STaR](https://arxiv.org/abs/2203.14465)、[DeepSeekMath](https://arxiv.org/abs/2402.03300) | 对照筛出正确轨迹再训练和在 rollout 上做策略更新。核对奖励信号、模型起点和评估条件。 |
+| [Dr. GRPO](https://arxiv.org/abs/2503.20783)、[DAPO](https://arxiv.org/abs/2503.14476)、[MaxRL](https://arxiv.org/abs/2602.02710)、[GSPO](https://arxiv.org/abs/2507.18071) | 从公开消融里拆出长度权重、组内归一化、采样和重要性比值的作用，区分单因素结论与整套配方的结果。 |
+
+每个案例记录**问题、方法、对照、观测和适用范围**。引用公开曲线时记下模型、数据、训练和推理预算、评估口径，明确区分论文实测、公式推论、本地小例三种证据。正式 MATH 全量错误分析继续暂缓，用小样本学习分析方法即可。
 
 ## 本地环境与验证方式
 
-现有项目 `.venv` 用于本地代码和测试，按改动范围运行定向检查。最近一次 61 项回归的范围为
+现有项目 `.venv` 用于本地代码和测试，按改动范围运行定向检查。最近一次七文件回归命令如下。
 
 ```sh
-env -u UPDATE_SNAPSHOTS HF_HUB_OFFLINE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+env -u UPDATE_SNAPSHOTS HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
   .venv/bin/python -m pytest \
   tests/test_sft.py tests/test_logging.py tests/test_sft_optimizer_step.py \
-  tests/test_train_sft.py tests/test_grpo.py tests/test_train_grpo.py -q
+  tests/test_train_sft.py tests/test_grpo.py tests/test_train_grpo.py tests/test_dpo.py -q
 ```
 
 历史推理调试使用独立的 `~/.venv-vllm-metal/` 环境。当前 baseline 入口仍配置 GSM8K 10 条与 Mac 调试模型，正式 MATH 入口尚待替换。[math_baseline.py](cs336_alignment/math_baseline.py#L24)
 
 如后续恢复训练卡资源，再按实际设备核对依赖、模型、数据、显存和持久化存储。先做短生成、评分、有限 loss/梯度与参数更新验证，再按需补 checkpoint 保存恢复和所选正式实验，不预设卡型、吞吐或排期。
 
-## 后续待选
-
-#17、23–25 保持待选状态。可先通过指导阅读设计和结果学习，再决定是否亲自复现。后续算力安排服务于主动选择的实验。
-
-Safety/RLHF 是独立的可选补充，共 16 题。可选的本地练习包括 packed dataset、batch 迭代、MMLU/GSM8K parser 与 DPO loss 的 5 个 adapter，当前留待以后选择。
-
 ## 个人检查清单
 
 - [x] SFT 基础 #2–7 完成，训练 CLI、多 epoch 与 FP32/BF16 tiny 更新验证已具备。
-- [x] GRPO 基础 #10–15 完成，单批单次更新循环与 7 项训练回归已具备。
-- [x] 六文件离线回归 61 项通过，正式训练产物与测试证据已区分。
+- [x] GRPO 基础 #10–15 和本地训练循环已完成。
 - [x] #22 同批多 epoch 与分训练批已实现，已验证缓存、更新次数与梯度累积边界。
-- [ ] 通过指导完成 #1、8、9 的实验设计与结果分析学习，正式错误分析仍暂缓。
-- [ ] 结合现有 #12、16 和 #22 的实现，完成 #18、20、21、19 的机制、小例与条件结论学习。
+- [x] 补充题 `dpo_loss` 和 tiny GPT-2 单步更新已验证。
+- [ ] 指导学习 HH 偏好数据、DPO 训练流程、安全评估和公开案例。
+- [ ] 指导学习 #1、#8–9 的评估设计和复现条件。
+- [ ] 指导学习 #16–21、#23–26 的曲线分析、消融和预算取舍，结合已有 #12、#22 复习并延伸到 2026 的 MaxRL、GSPO。
 
-#17、23–25、#26 及 Safety/RLHF 不计入当前个人必做清单，后续可重新选择。正式课程口径的未交付项仍如上表保留，个人自学达成与课程完整交付分别记录。
+个人计划接下来按上面的课程和案例推进。正式交付状态继续按主讲义记录，Safety/RLHF 是独立的选做补充。
